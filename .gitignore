@@ -1,0 +1,33 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+tiny-url
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# SQLite databases (default + WAL/SHM sidecars)
+*.db
+*.db-wal
+*.db-shm
+
+# TLS material — never commit private keys or certs
+*.pem
+*.key
+*.crt
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Go workspace
+go.work
+go.work.sum

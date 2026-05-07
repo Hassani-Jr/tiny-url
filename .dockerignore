@@ -1,0 +1,40 @@
+# Keep the build context lean: we only need source + go.mod/sum + static/.
+# Everything below either gets rebuilt from source or has no business in
+# the image.
+
+.git
+.github
+.claude
+.vscode
+.idea
+
+# Compiled output (the Dockerfile builds a fresh binary)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+tiny-url
+
+# Test / coverage artefacts
+*.test
+*.out
+coverage.*
+
+# SQLite databases shouldn't ship inside images
+*.db
+*.db-wal
+*.db-shm
+
+# TLS material — never bake into images
+*.pem
+*.key
+*.crt
+
+# Docs aren't needed at runtime
+README.md
+LICENSE*
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

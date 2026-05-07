@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tiny URL</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <header class="topbar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">⚡</span>
+                <span class="brand-text">Tiny URL</span>
+            </div>
+            <div class="topbar-actions">
+                <input type="search" id="searchInput" placeholder="Search code or destination" aria-label="Search short URLs">
+                <button id="importBtn" class="btn">Import</button>
+                <button id="newBtn" class="btn btn-primary">+ New URL</button>
+                <button id="themeToggle" class="btn btn-icon" aria-label="Toggle theme" title="Toggle theme">
+                    <span id="themeIcon">🌙</span>
+                </button>
+            </div>
+        </header>
+
+        <main class="dashboard">
+            <section id="createPanel" class="create-panel hidden" aria-labelledby="createPanelTitle">
+                <h2 id="createPanelTitle">Create short URL</h2>
+                <form id="createForm" novalidate>
+                    <div class="form-grid">
+                        <label class="field">
+                            <span class="field-label">Destination URL</span>
+                            <input type="url" id="urlInput" placeholder="https://example.com/very/long/url" required>
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Custom alias (optional)</span>
+                            <input type="text" id="customCodeInput" placeholder="my-link" pattern="[A-Za-z0-9_-]{3,32}">
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Expiration (minutes, optional)</span>
+                            <input type="number" id="expirationInput" placeholder="never" min="1">
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="cancelCreateBtn" class="btn btn-ghost">Cancel</button>
+                        <button type="submit" id="createBtn" class="btn btn-primary">Create</button>
+                    </div>
+                </form>
+            </section>
+
+            <section id="importPanel" class="create-panel hidden" aria-labelledby="importPanelTitle">
+                <h2 id="importPanelTitle">Import existing short URL</h2>
+                <p class="muted" style="margin-bottom: 0.75rem;">Paste a short code and its admin token to add it to this browser's dashboard. The token is verified against the server before being saved.</p>
+                <form id="importForm" novalidate>
+                    <div class="form-grid">
+                        <label class="field">
+                            <span class="field-label">Short code</span>
+                            <input type="text" id="importCodeInput" placeholder="aBc123" required pattern="[A-Za-z0-9_-]{3,32}">
+                        </label>
+                        <label class="field" style="grid-column: span 2;">
+                            <span class="field-label">Admin token</span>
+                            <input type="text" id="importTokenInput" placeholder="base64-encoded-32-byte-token" required autocomplete="off" spellcheck="false">
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="cancelImportBtn" class="btn btn-ghost">Cancel</button>
+                        <button type="submit" id="importSubmitBtn" class="btn btn-primary">Import</button>
+                    </div>
+                </form>
+            </section>
+
+            <section id="emptyState" class="empty-state hidden">
+                <div class="empty-state-card">
+                    <div class="empty-state-icon" aria-hidden="true">🔗</div>
+                    <h2>No short URLs yet</h2>
+                    <p class="muted">Tokens are kept in this browser only. Click <strong>+ New URL</strong> to create your first one, or <strong>Import</strong> a code+token saved from another device.</p>
+                    <div style="display: flex; gap: 0.5rem; justify-content: center;">
+                        <button class="btn btn-primary" id="emptyCreateBtn">+ New URL</button>
+                        <button class="btn" id="emptyImportBtn">Import</button>
+                    </div>
+                </div>
+            </section>
+
+            <section id="loadingState" class="loading-state">
+                <div class="muted">Loading your short URLs...</div>
+            </section>
+
+            <section id="tableCard" class="table-card hidden">
+                <div class="table-meta">
+                    <span class="muted" id="tableSummary"></span>
+                    <div class="table-actions">
+                        <button id="exportBtn" class="btn btn-ghost btn-sm" title="Export visible rows as CSV">⬇ Export CSV</button>
+                        <button id="refreshBtn" class="btn btn-ghost btn-sm" title="Refresh">↻ Refresh</button>
+                    </div>
+                </div>
+                <div id="bulkBar" class="bulk-bar hidden" role="region" aria-label="Bulk actions">
+                    <span class="bulk-count"><strong id="bulkCount">0</strong> selected</span>
+                    <button id="bulkDeleteBtn" class="btn btn-danger btn-sm">Delete selected</button>
+                    <button id="bulkClearBtn" class="btn btn-ghost btn-sm">Clear</button>
+                </div>
+                <div class="table-scroll">
+                    <table class="url-table">
+                        <thead>
+                            <tr>
+                                <th class="checkbox-col"><input type="checkbox" id="selectAllCheckbox" aria-label="Select all"></th>
+                                <th class="sortable" data-sort="code">Code</th>
+                                <th class="sortable" data-sort="destination">Destination</th>
+                                <th class="sortable num" data-sort="clicks">Clicks</th>
+                                <th class="sortable" data-sort="last_accessed">Last click</th>
+                                <th class="sortable" data-sort="expires">Expires</th>
+                                <th>Status</th>
+                                <th class="actions-col" aria-label="Actions"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="urlTableBody"></tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+
+        <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="false"></div>
+
+        <footer class="appfooter">
+            <span class="muted">Press <kbd>/</kbd> to search · <kbd>n</kbd> to create · <kbd>i</kbd> to import · <kbd>Esc</kbd> to close</span>
+        </footer>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>

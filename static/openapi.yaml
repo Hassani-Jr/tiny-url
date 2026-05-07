@@ -1,0 +1,509 @@
+openapi: 3.0.3
+
+info:
+  title: Tiny URL Shortener API
+  version: 1.0.0
+  description: |
+    Single-binary URL shortener with click analytics, owner-token auth, SSRF
+    protection, deny-list, and a privacy-respecting click event log.
+
+    ## Authentication
+
+    Mutating endpoints (`PATCH /api/url/{code}`, `DELETE /api/url/{code}`)
+    and analytics endpoints (`GET /api/analytics/{code}`,
+    `GET /api/analytics/{code}/clicks`) require the per-URL **admin token**
+    returned at creation time, supplied as `Authorization: Bearer <token>`.
+
+    The plaintext token is shown **once** in the `POST /api/shorten`
+    response. The server stores only its SHA-256 hash. Save the token at
+    create time — there is no recovery mechanism.
+
+    ## CSRF
+
+    `POST /api/shorten` requires the `X-Requested-With: XMLHttpRequest`
+    header. This blocks `<form>` / `<img>` cross-origin abuse from a
+    malicious page. The header cannot be set cross-origin without a CORS
+    preflight, which the server doesn't permit.
+
+    `PATCH` and `DELETE` are gated by the bearer token and don't need this
+    header (the token is unforgeable from another origin).
+
+    ## Rate limiting
+
+    All endpoints are subject to per-IP rate limits except `/healthz`,
+    `/readyz`, `/metrics`, and `/favicon.ico`. Limits are configurable via
+    `WRITE_RATE_PER_MIN` and `READ_RATE_PER_MIN`. On limit breach the
+    response is `429 Too Many Requests` with a `Retry-After` header.
+
+  contact:
+    name: Tiny URL maintainer
+
+servers:
+  - url: http://localhost:8080
+    description: Local dev (memory backend by default)
+  - url: https://short.example.com
+    description: Operator-deployed production host
+
+tags:
+  - name: URLs
+    description: Create, redirect, modify, delete short URLs.
+  - name: Analytics
+    description: Owner-only metrics and click event log.
+  - name: Operations
+    description: Liveness, readiness, metrics.
+
+paths:
+  /api/shorten:
+    post:
+      tags: [URLs]
+      summary: Create a short URL
+      description: |
+        Returns a fresh short code, the canonical short URL, and the admin
+        token (shown ONCE). The destination URL is validated:
+        scheme must be `http`/`https`, length ≤ 2048, no embedded
+        credentials, and the host must not resolve to a private/loopback/
+        link-local/multicast/CGNAT address (SSRF guard).
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShortenRequest'
+      responses:
+        '201':
+          description: Created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShortenResponse'
+        '400':
+          description: Invalid request (bad scheme, SSRF blocked, oversized body, invalid custom code, …)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: Missing X-Requested-With header
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Custom code already in use
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/url/{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    patch:
+      tags: [URLs]
+      summary: Update destination URL and/or expiration
+      description: |
+        Owner-token gated. At least one of `url` or `expiration_mins` must
+        be provided. New destination URLs go through the same SSRF and
+        deny-list checks as `POST /api/shorten`.
+
+        | `expiration_mins`     | Effect                                           |
+        |-----------------------|--------------------------------------------------|
+        | omitted               | leave expiration unchanged                       |
+        | `0`                   | **remove** expiration — URL becomes never-expiring |
+        | `> 0`                 | set expiration to N minutes from now             |
+      security:
+        - BearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatchResponse'
+        '400':
+          description: Invalid body or destination URL rejected
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+    delete:
+      tags: [URLs]
+      summary: Delete a short URL
+      description: |
+        Owner-token gated. Cascades to the click event log on the SQLite
+        backend (foreign key `ON DELETE CASCADE`). Returns 204 even if the
+        code was already gone (idempotent).
+      security:
+        - BearerToken: []
+      responses:
+        '204': { description: Deleted }
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired (cleanup goroutine will reap) }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [URLs]
+      summary: Redirect to the original URL
+      description: |
+        302 redirect. Increments the click counter and appends a click
+        event atomically. The destination is re-validated at redirect time
+        (deny-list + runtime SSRF check) so DNS rebinding cannot
+        retroactively turn a previously-valid host into a private-network
+        target.
+      responses:
+        '302':
+          description: Redirect to original URL
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+        '404': { description: Short code does not exist }
+        '410': { description: URL has expired }
+        '451':
+          description: |
+            Destination is on the deny-list, or its host now resolves to
+            a private/loopback address (rebinding caught at redirect time).
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/analytics/{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [Analytics]
+      summary: Get click counter and metadata for a short URL
+      security:
+        - BearerToken: []
+      responses:
+        '200':
+          description: OK
+          headers:
+            Cache-Control:
+              schema: { type: string, default: no-store }
+              description: Owner-only data; never cached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/analytics/{code}/clicks:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [Analytics]
+      summary: Get the per-event click log
+      description: |
+        Returns the most recent click events, newest-first. The memory
+        backend caps at 1000 events per code; the SQLite backend honors
+        `CLICK_RETENTION_DAYS` (default 90). `ip_hash` is only present
+        when `CLICK_LOG_IP=true` on the server.
+      security:
+        - BearerToken: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Max events to return; clamped server-side at 200.
+      responses:
+        '200':
+          description: OK
+          headers:
+            Cache-Control:
+              schema: { type: string, default: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClicksResponse'
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/qr/{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [URLs]
+      summary: Get a PNG QR code encoding the short URL
+      description: |
+        Unauthenticated by design — the encoded value is the same short URL
+        anyone with the code can already visit, so a QR adds no privilege.
+      responses:
+        '200':
+          description: PNG image
+          headers:
+            Cache-Control:
+              schema: { type: string, default: 'public, max-age=86400, immutable' }
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '404': { description: Short code does not exist }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      description: |
+        Cheap, no-IO. Always 200 on a running process. Use as a Kubernetes
+        `livenessProbe`. Successful (`<400`) hits are deliberately not
+        logged to avoid drowning real request logs.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:  { type: string, example: ok }
+                  storage: { type: string, example: memory }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness probe (storage-aware)
+      description: |
+        Pings the storage backend with a 2-second timeout. Use as a
+        Kubernetes `readinessProbe` so a database outage drains traffic
+        at the load balancer instead of being absorbed silently.
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Storage backend not reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: not_ready }
+                  error:  { type: string }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Expvar metrics exposition
+      description: |
+        Standard Go `expvar` JSON. Includes `http_requests_total` (status
+        class), `http_requests_route_total` (route + status class),
+        `http_requests_in_flight`, `panics_total`, plus runtime metrics.
+
+        When `METRICS_TOKEN` is set, this endpoint requires
+        `Authorization: Bearer <token>`; otherwise it is open.
+      responses:
+        '200':
+          description: expvar JSON exposition
+          content:
+            application/json: {}
+        '401':
+          description: METRICS_TOKEN is configured and the request lacked or mismatched the token
+
+components:
+
+  parameters:
+    Code:
+      in: path
+      name: code
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{3,32}$'
+      description: 3-32 chars of `[A-Za-z0-9_-]`. Random base62 by default; user-chosen via `custom_code`.
+    XRequestedWith:
+      in: header
+      name: X-Requested-With
+      required: true
+      schema:
+        type: string
+        enum: [XMLHttpRequest]
+      description: CSRF defense for `POST /api/shorten`.
+
+  headers:
+    RequestID:
+      schema: { type: string }
+      description: |
+        Per-request correlation ID. Honors inbound `X-Request-ID`
+        (≤ 64 chars) or generates a 16-hex-char ID. Echoed in every
+        structured log line for the request.
+
+  responses:
+    RateLimited:
+      description: Per-IP rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until the bucket refills.
+
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: '32-byte URL-safe-base64 admin token'
+      description: |
+        Per-URL admin token returned at creation. Compared in constant
+        time against the stored SHA-256 hash.
+
+  schemas:
+
+    ShortenRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Destination. Must be `http://` or `https://` and resolve to a public IP.
+          example: https://example.com/some/long/path
+        custom_code:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{3,32}$'
+          description: Optional user-chosen alias. Must be unique.
+          example: my-link
+        expiration_mins:
+          type: integer
+          minimum: 0
+          description: Optional expiration. `0` or omitted → never expires. Capped at `MAX_EXPIRATION_MINUTES`.
+
+    ShortenResponse:
+      type: object
+      required: [short_code, short_url, original_url, admin_token]
+      properties:
+        short_code:
+          type: string
+          example: aBc123
+        short_url:
+          type: string
+          format: uri
+          example: http://localhost:8080/aBc123
+        original_url:
+          type: string
+          format: uri
+        admin_token:
+          type: string
+          description: |
+            **Shown once.** Required for analytics, edit, and delete on
+            this short code. Save it deliberately.
+          example: 7XQ-very-long-base64-token-shown-only-here
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    AnalyticsResponse:
+      type: object
+      properties:
+        short_code:    { type: string }
+        original_url:  { type: string, format: uri }
+        click_count:   { type: integer }
+        created_at:    { type: string, format: date-time }
+        expires_at:    { type: string, format: date-time, nullable: true }
+        last_accessed: { type: string, format: date-time, nullable: true }
+
+    ClicksResponse:
+      type: object
+      properties:
+        short_code: { type: string }
+        count:      { type: integer, description: Number of events returned (≤ limit). }
+        events:
+          type: array
+          description: Events newest-first.
+          items: { $ref: '#/components/schemas/ClickEvent' }
+
+    ClickEvent:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: When the click occurred.
+        ip_hash:
+          type: string
+          description: Hex-encoded SHA-256 of `salt || ip`. Present only when `CLICK_LOG_IP=true`.
+        referer:
+          type: string
+          description: Truncated to 512 chars.
+        ua_class:
+          type: string
+          enum: [bot, mobile, tablet, desktop, unknown]
+          description: |
+            Coarse User-Agent bucket. The raw UA is intentionally not
+            stored — it would be a fingerprinting vector and a targeting
+            hint for exploit kits.
+
+    PatchRequest:
+      type: object
+      description: At least one of `url` / `expiration_mins` must be present.
+      properties:
+        url:
+          type: string
+          format: uri
+          description: New destination. Re-validated against SSRF + deny-list.
+        expiration_mins:
+          type: integer
+          minimum: 0
+          description: '`0` removes expiration; `>0` sets new expiry from now; omitted → unchanged.'
+
+    PatchResponse:
+      type: object
+      properties:
+        short_code:   { type: string }
+        original_url: { type: string, format: uri }
+        expires_at:   { type: string, format: date-time, nullable: true }
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:   { type: string, example: 'Bad Request' }
+        message: { type: string, example: 'URL host points at a private or reserved network' }

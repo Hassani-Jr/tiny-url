@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -o /tmp/r6.json -w \"HTTP %{http_code}\\\\n\" -X POST http://localhost:8090/api/shorten -H \"Content-Type: application/json\" -H \"X-Requested-With: XMLHttpRequest\" -d '{\"url\":\"https://1.1.1.1/\"}')",
+      "Read(//tmp/**)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\nLocation: %header{location}\\\\n\" \"http://localhost:8090/6zC7JG\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" \"http://localhost:8090/nope12\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8091/)",
+      "Bash(go test *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Bash(go mod *)",
+      "Bash(curl -s -o /dev/null -w \"GET /  → %{http_code}\\\\n\" http://localhost:18080/)",
+      "Bash(curl -s -o /dev/null -w \"GET /static/app.js → %{http_code}\\\\n\" http://localhost:18080/static/app.js)",
+      "Bash(curl -s -o /dev/null -w \"GET /favicon.ico → %{http_code}\\\\n\" http://localhost:18080/favicon.ico)",
+      "Bash(curl -s -D - http://localhost:18080/api/analytics/anything -o /dev/null)",
+      "Bash(curl -s -o /dev/null -w \"  /healthz %{http_code}\\\\n\" http://localhost:18080/healthz)",
+      "Bash(curl -s -o /dev/null -w \"  /api/analytics/x %{http_code}\\\\n\" http://localhost:18080/api/analytics/x)",
+      "Read(//c/tmp/**)",
+      "Bash(PORT=18082 /tmp/tiny-url-smoke.exe)",
+      "Bash(curl -fs http://localhost:18085/healthz)",
+      "Bash(PORT=18085 WRITE_RATE_PER_MIN=10000000 READ_RATE_PER_MIN=10000000 STORAGE_BACKEND=memory CLICK_LOG_IP=true /tmp/tinyurl-bench.exe *)",
+      "Bash(netstat -ano)",
+      "Bash(grep --line-buffered -E '_UP$|_DONE_|^ALL_DONE$')",
+      "Bash(grep -q \"^ALL_DONE$\" \"C:/Users/wissa/AppData/Local/Temp/claude/C--Users-wissa-tiny-url/65c3827e-ef55-43a5-943f-b302e4d91350/tasks/bl8a9s06z.output\")",
+      "Bash(node --check /c/Users/wissa/tiny-url/static/app.js)",
+      "Bash(grep -q \"^done$\" \"C:/Users/wissa/AppData/Local/Temp/claude/C--Users-wissa-tiny-url/65c3827e-ef55-43a5-943f-b302e4d91350/tasks/bml3kpioy.output\")",
+      "Bash(python3 -c 'import yaml; d = yaml.safe_load\\(open\\(\"static/openapi.yaml\"\\)\\); paths = list\\(d[\"paths\"].keys\\(\\)\\); schemas = list\\(d[\"components\"][\"schemas\"].keys\\(\\)\\); print\\(f\"YAML parses cleanly. {len\\(paths\\)} paths, {len\\(schemas\\)} schemas.\"\\); print\\(\"paths:\", paths\\); print\\(\"schemas:\", schemas\\)')",
+      "Bash(docker --version)",
+      "Bash(pip install *)",
+      "Bash(python3 -c 'import yaml; d = yaml.safe_load\\(open\\(\"static/openapi.yaml\"\\)\\); paths = list\\(d[\"paths\"].keys\\(\\)\\); schemas = list\\(d[\"components\"][\"schemas\"].keys\\(\\)\\); print\\(f\"OpenAPI YAML: {len\\(paths\\)} paths, {len\\(schemas\\)} schemas\"\\); print\\(\" paths:\", paths\\); print\\(\" schemas:\", schemas\\)')",
+      "Bash(docker build *)",
+      "Bash(docker run *)",
+      "Bash(curl -fs http://localhost:18095/healthz)",
+      "Bash(curl -s -o /dev/null -w \"  /healthz       → %{http_code}\\\\n\" http://localhost:18095/healthz)",
+      "Bash(curl -s -o /dev/null -w \"  /readyz        → %{http_code}\\\\n\" http://localhost:18095/readyz)",
+      "Bash(curl -s -o /dev/null -w \"  /              → %{http_code}\\\\n\" http://localhost:18095/)"
+    ]
+  },
+  "enabledPlugins": {
+    "ralph-loop@claude-plugins-official": true
+  }
+}
