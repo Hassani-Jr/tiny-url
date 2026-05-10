@@ -40,6 +40,17 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Flush delegates to the underlying ResponseWriter when it supports it.
+// Without this, embedding http.ResponseWriter masks http.Flusher: a
+// downstream handler doing `w.(http.Flusher)` sees the wrapper's concrete
+// type, which does not implement Flush — and the SSE stream handler bails
+// out with "streaming not supported".
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Logger emits one structured log line per request via slog. Status defaults
 // to 200 if the handler never explicitly sets it (which mirrors Go's
 // net/http behaviour). The request ID is included so log lines can be

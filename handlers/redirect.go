@@ -19,6 +19,13 @@ type RedirectConfig struct {
 	DenyList   *services.DenyList
 	TrustProxy bool
 	LogIP      bool // hash and store the client IP on each click event
+	// Stream, if set, receives a Publish() call for every successful
+	// redirect. Drives the live-clicks SSE endpoint. Nil disables the
+	// fan-out (e.g. in tests).
+	Stream *services.ClickStream
+	// DNSCache, if set, memoises the runtime SSRF re-check across hot
+	// URLs. Nil falls through to direct resolution on every redirect.
+	DNSCache *services.DNSCache
 }
 
 // RedirectHandler handles URL redirect requests.
@@ -75,9 +82,12 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte("This short URL has been disabled."))
 			return
 		}
-		if err := services.ValidateHostAtRuntime(host); err != nil {
+		// Use the cache when available — it's nil-safe so this works
+		// in tests that wire RedirectConfig{} without thinking about it.
+		hostErr := h.cfg.DNSCache.ValidateHost(host)
+		if hostErr != nil {
 			slog.WarnContext(r.Context(), "destination host failed runtime validation",
-				"code", shortCode, "host", host, "err", err)
+				"code", shortCode, "host", host, "err", hostErr)
 			w.WriteHeader(http.StatusUnavailableForLegalReasons)
 			_, _ = w.Write([]byte("This short URL has been disabled."))
 			return
@@ -99,6 +109,12 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.storage.RecordClick(shortCode, ev); err != nil {
 		slog.WarnContext(r.Context(), "recordClick failed", "code", shortCode, "err", err)
+	} else if h.cfg.Stream != nil {
+		// Only publish AFTER RecordClick succeeded — otherwise an SSE
+		// subscriber would see events that aren't reflected in the
+		// canonical click_events table. Best-effort: Publish drops on a
+		// full subscriber buffer rather than blocking the redirect.
+		h.cfg.Stream.Publish(shortCode, ev)
 	}
 
 	http.Redirect(w, r, urlMapping.OriginalURL, http.StatusFound)

@@ -100,6 +100,10 @@
      * this map to decide whether to flash a "live click" pulse on the row.
      */
     const refreshSnapshot = new Map();
+    /** AbortController per code for the live SSE stream. Open on row
+     *  expand; aborted on collapse so we don't leak goroutines on the
+     *  server (each open stream is one server-side subscription). */
+    const liveStreams = new Map();
 
     // ---------- theme ------------------------------------------------------
 
@@ -127,13 +131,43 @@
 
     // ---------- toasts -----------------------------------------------------
 
-    function toast(msg, kind = 'info') {
+    /**
+     * Show a transient notification.
+     *   opts.actionLabel + opts.action → render an inline action button
+     *      (e.g. "Undo"). Clicking it fires opts.action and dismisses early.
+     *   opts.durationMs → override the default lifetime (used by the
+     *      soft-delete flow to give users a longer undo window).
+     */
+    function toast(msg, kind = 'info', opts = {}) {
         const node = document.createElement('div');
         node.className = `toast toast-${kind}`;
-        node.textContent = msg;
-        node.addEventListener('click', () => dismissToast(node));
+
+        const text = document.createElement('span');
+        text.textContent = msg;
+        text.style.flex = '1';
+        node.appendChild(text);
+
+        if (opts.actionLabel && typeof opts.action === 'function') {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'toast-action';
+            btn.textContent = opts.actionLabel;
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                opts.action();
+                dismissToast(node);
+            });
+            node.appendChild(btn);
+        } else {
+            // Plain toast — click the body to dismiss early.
+            node.addEventListener('click', () => dismissToast(node));
+            node.style.cursor = 'pointer';
+        }
+
         els.toastContainer.appendChild(node);
-        setTimeout(() => dismissToast(node), TOAST_MS);
+        const lifetime = typeof opts.durationMs === 'number' ? opts.durationMs : TOAST_MS;
+        setTimeout(() => dismissToast(node), lifetime);
+        return node;
     }
     function dismissToast(node) {
         if (!node || !node.parentNode) return;
@@ -246,6 +280,15 @@
             headers: { 'Authorization': `Bearer ${token}` },
         });
         return r.status;
+    }
+    async function apiRotate(code, token) {
+        const r = await fetch(`/api/url/${encodeURIComponent(code)}/rotate`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}` },
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.message || `Rotate failed (${r.status})`);
+        return data;
     }
 
     // Bounded-concurrency promise pool. Avoids opening 100+ concurrent
@@ -913,32 +956,34 @@
             }
         }));
         wrap.appendChild(tr);
+
+        wrap.appendChild(makeBtn('Rotate token', 'btn btn-ghost btn-sm', async () => {
+            if (!confirm(`Issue a new admin token for /${row.code}? The current token will be invalidated immediately.`)) return;
+            try {
+                const data = await apiRotate(row.code, row.token);
+                saveToken(row.code, data.admin_token);
+                // Update the in-memory row so subsequent calls use the new token.
+                row.token = data.admin_token;
+                rows.set(row.code, row);
+                render();
+                toast('Token rotated. New token saved in this browser.', 'success');
+            } catch (err) {
+                toast(err.message, 'error');
+            }
+        }));
+
         return wrap;
     }
 
     function buildDangerZone(row) {
         const wrap = document.createElement('div');
         wrap.style.marginTop = '1rem';
-        wrap.appendChild(makeBtn('Delete this short URL', 'btn btn-danger btn-sm', async () => {
-            if (!confirm(`Delete /${row.code}? This cannot be undone.`)) return;
-            try {
-                const status = await apiDelete(row.code, row.token);
-                if (status === 204 || status === 404) {
-                    dropLocalEntries(row.code);
-                    rows.delete(row.code);
-                    expanded.delete(row.code);
-                    render();
-                    toast(`/${row.code} deleted.`, 'success');
-                } else if (status === 401 || status === 403) {
-                    toast('Admin token rejected.', 'error');
-                } else if (status === 410) {
-                    toast('Already expired and being cleaned up.', 'info');
-                } else {
-                    toast(`Delete failed (${status}).`, 'error');
-                }
-            } catch (_) {
-                toast('Network error during delete.', 'error');
-            }
+        wrap.appendChild(makeBtn('Delete this short URL', 'btn btn-danger btn-sm', () => {
+            // Optimistic delete with a 6-second Undo window. The actual
+            // server DELETE is delayed; if the user clicks Undo, we cancel
+            // the timer and restore the row from the captured snapshot.
+            // No confirm dialog — undo IS the confirmation.
+            softDelete([row.code]);
         }));
         return wrap;
     }
@@ -958,9 +1003,94 @@
     }
 
     function toggleExpand(code) {
-        if (expanded.has(code)) expanded.delete(code);
-        else expanded.add(code);
+        if (expanded.has(code)) {
+            expanded.delete(code);
+            stopLiveStream(code);
+        } else {
+            expanded.add(code);
+            startLiveStream(code);
+        }
         render();
+    }
+
+    /**
+     * Open a Server-Sent Events stream to /api/analytics/{code}/stream.
+     * Browser EventSource doesn't support Authorization headers, so we
+     * use fetch() with a streaming body reader and parse the SSE wire
+     * format ourselves. AbortController on the request lets us close the
+     * stream when the row collapses.
+     *
+     * Each click event from the server triggers a refresh of that row's
+     * analytics — the displayed click_count goes up, the pulse fires,
+     * and the events list (if visible) gets re-fetched naturally on the
+     * next render via lazy loadEvents.
+     */
+    function startLiveStream(code) {
+        if (liveStreams.has(code)) return;
+        const row = rows.get(code);
+        if (!row || row.status !== 'active') return;
+
+        const controller = new AbortController();
+        liveStreams.set(code, controller);
+
+        (async () => {
+            try {
+                const resp = await fetch(`/api/analytics/${encodeURIComponent(code)}/stream`, {
+                    headers: { 'Authorization': `Bearer ${row.token}` },
+                    signal: controller.signal,
+                });
+                if (!resp.ok || !resp.body) return; // 401/404/410 etc.
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    // SSE events are separated by a blank line.
+                    let idx;
+                    while ((idx = buf.indexOf('\n\n')) !== -1) {
+                        const raw = buf.slice(0, idx);
+                        buf = buf.slice(idx + 2);
+                        handleSSEEvent(code, raw);
+                    }
+                }
+            } catch (e) {
+                // AbortError is expected when stopLiveStream fires; anything
+                // else (network blip, server restart) just ends the stream
+                // and the periodic loadAll() will bring the row up to date.
+            } finally {
+                if (liveStreams.get(code) === controller) {
+                    liveStreams.delete(code);
+                }
+            }
+        })();
+    }
+
+    function stopLiveStream(code) {
+        const ctrl = liveStreams.get(code);
+        if (ctrl) {
+            ctrl.abort();
+            liveStreams.delete(code);
+        }
+    }
+
+    function handleSSEEvent(code, raw) {
+        // Parse a single SSE event: lines like "event: foo", "data: ...",
+        // ":heartbeat" (comment, ignored).
+        let event = 'message';
+        let data = '';
+        for (const line of raw.split('\n')) {
+            if (line.startsWith(':')) continue; // comment / heartbeat
+            if (line.startsWith('event: ')) event = line.slice(7).trim();
+            else if (line.startsWith('data: ')) data += line.slice(6);
+        }
+        if (event !== 'click' || !data) return;
+        // We don't parse the JSON payload here — the only signal we need
+        // is "a click happened, refresh this row." refreshOne will
+        // increment the displayed count and trigger detectActivity which
+        // flashes the dot.
+        refreshOne(code);
     }
 
     async function copyShortURL(code) {
@@ -1153,37 +1283,98 @@
         render();
     }
 
-    async function bulkDelete() {
+    function bulkDelete() {
         if (selected.size === 0) return;
-        const n = selected.size;
-        if (!confirm(`Delete ${n} selected short URL${n === 1 ? '' : 's'}? This cannot be undone.`)) return;
-
         const codes = Array.from(selected);
-        let ok = 0, fail = 0;
-        await pool(codes, 6, async (code) => {
-            const row = rows.get(code);
-            if (!row) return;
-            try {
-                const status = await apiDelete(code, row.token);
-                if (status === 204 || status === 404 || status === 410) {
-                    dropLocalEntries(code);
-                    rows.delete(code);
-                    expanded.delete(code);
-                    selected.delete(code);
-                    ok++;
-                } else {
-                    fail++;
-                }
-            } catch (_) {
-                fail++;
-            }
-        });
-        render();
-        if (fail === 0) {
-            toast(`Deleted ${ok} short URL${ok === 1 ? '' : 's'}.`, 'success');
-        } else {
-            toast(`Deleted ${ok}, failed ${fail}. Check tokens and retry.`, 'warning');
+        // Snapshot of the selection — softDelete will clear it optimistically.
+        softDelete(codes);
+    }
+
+    /**
+     * Optimistic delete + undo. The row(s) disappear immediately; an "Undo"
+     * toast holds them in a parking-lot for UNDO_MS. After the window:
+     *   - if undone → restore everything, no server call.
+     *   - if not   → fan out the actual DELETE requests, then drop the
+     *                local-storage tokens/labels for codes the server
+     *                accepted as deleted.
+     *
+     * Closing the tab during the window cancels the pending delete (the
+     * setTimeout never fires). That's a feature: an accidental delete
+     * followed by a panic-close leaves the URL alive.
+     */
+    const UNDO_MS = 6000;
+    function softDelete(codes) {
+        if (codes.length === 0) return;
+        // Capture full state so we can restore on undo: row object, label,
+        // selection, expansion, snapshot. Capture before any mutation.
+        const captured = codes.map((code) => ({
+            code,
+            row: rows.get(code),
+            label: getLabel(code),
+            wasSelected: selected.has(code),
+            wasExpanded: expanded.has(code),
+            snapshot: refreshSnapshot.get(code),
+        })).filter(c => c.row);
+        if (captured.length === 0) return;
+
+        // Optimistic remove from the dashboard. Close any live stream
+        // before the row disappears so we don't leak server-side
+        // subscriptions for tokens that may be about to be invalidated.
+        for (const c of captured) {
+            stopLiveStream(c.code);
+            rows.delete(c.code);
+            expanded.delete(c.code);
+            selected.delete(c.code);
         }
+        render();
+
+        let undone = false;
+        const timer = setTimeout(async () => {
+            if (undone) return;
+            const failed = [];
+            await pool(captured, 6, async (c) => {
+                try {
+                    const status = await apiDelete(c.code, c.row.token);
+                    if (status === 204 || status === 404 || status === 410) {
+                        dropLocalEntries(c.code);
+                    } else {
+                        failed.push({ ...c, reason: `${status}` });
+                    }
+                } catch (e) {
+                    failed.push({ ...c, reason: 'network' });
+                }
+            });
+            if (failed.length > 0) {
+                // Restore the rows we couldn't delete — UI state needs to
+                // match server reality.
+                for (const c of failed) {
+                    rows.set(c.code, c.row);
+                    if (c.snapshot !== undefined) refreshSnapshot.set(c.code, c.snapshot);
+                }
+                render();
+                toast(`Failed to delete ${failed.length} URL${failed.length === 1 ? '' : 's'}.`, 'error');
+            }
+        }, UNDO_MS);
+
+        const label = captured.length === 1
+            ? `/${captured[0].code} deleted.`
+            : `Deleted ${captured.length} short URLs.`;
+
+        toast(label, 'success', {
+            actionLabel: 'Undo',
+            durationMs: UNDO_MS,
+            action: () => {
+                undone = true;
+                clearTimeout(timer);
+                for (const c of captured) {
+                    rows.set(c.code, c.row);
+                    if (c.wasSelected) selected.add(c.code);
+                    if (c.wasExpanded) expanded.add(c.code);
+                    if (c.snapshot !== undefined) refreshSnapshot.set(c.code, c.snapshot);
+                }
+                render();
+            },
+        });
     }
 
     function clearSelection() {
@@ -1284,6 +1475,8 @@
                     clearSelection();
                     e.preventDefault();
                 } else if (expanded.size) {
+                    // Close every live stream we opened with the row.
+                    for (const code of expanded) stopLiveStream(code);
                     expanded.clear();
                     render();
                     e.preventDefault();

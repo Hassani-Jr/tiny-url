@@ -8,16 +8,31 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"tiny-url/config"
-	"tiny-url/handlers"
-	"tiny-url/middleware"
 	"tiny-url/services"
 )
 
+// buildSHA is set at link time via -ldflags="-X main.buildSHA=$(git rev-parse --short HEAD)"
+// (see Makefile). When unset (e.g. `go run`), `tiny-url --version` falls
+// back to whatever runtime/debug.ReadBuildInfo can recover from VCS metadata.
+var buildSHA = ""
+
 func main() {
+	// Handle --version before doing any other work so it stays fast and
+	// has no side effects (no log output, no env reads). Operators
+	// `tiny-url --version` to confirm what's running on a host.
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "--version", "-version", "-v":
+			printVersion()
+			return
+		}
+	}
+
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
 	cfg := config.Load()
@@ -35,92 +50,10 @@ func main() {
 	}
 	store.StartCleanupRoutine(ctx, cfg.CleanupInterval)
 
-	denyList, err := loadDenyList(cfg)
+	handler, err := buildHandler(ctx, cfg, store)
 	if err != nil {
-		fatalf("deny-list: %v", err)
+		fatalf("handler init: %v", err)
 	}
-	if denyList != nil {
-		slog.Info("deny-list active", "hosts", denyList.Size())
-	}
-
-	// IP-hash salt is initialised even when LogClickIP is off — installing a
-	// salt is cheap, and tests / future env updates that flip the flag don't
-	// need to re-bootstrap.
-	services.SetClickSalt(cfg.ClickIPSalt)
-
-	staticAssets, err := handlers.NewStaticAssets(staticDirFS())
-	if err != nil {
-		fatalf("static assets: %v", err)
-	}
-
-	shortenHandler := handlers.NewShortenHandler(store, cfg.BaseURL, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
-	redirectHandler := handlers.NewRedirectHandler(store, handlers.RedirectConfig{
-		DenyList:   denyList,
-		TrustProxy: cfg.TrustProxy,
-		LogIP:      cfg.LogClickIP,
-	})
-	analyticsHandler := handlers.NewAnalyticsHandler(store)
-	clicksHandler := handlers.NewClicksHandler(store, 200)
-	deleteHandler := handlers.NewDeleteHandler(store)
-	patchHandler := handlers.NewPatchHandler(store, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
-	qrHandler := handlers.NewQRHandler(store, cfg.BaseURL)
-	healthHandler := handlers.NewHealthHandler(storageBackendName(cfg.StorageBackend))
-	readyHandler := handlers.NewReadyHandler(store, 2*time.Second)
-
-	writeLimiter := middleware.NewLimiter(ctx, cfg.WriteRatePerMin, time.Minute, cfg.TrustProxy)
-	readLimiter := middleware.NewLimiter(ctx, cfg.ReadRatePerMin, time.Minute, cfg.TrustProxy)
-
-	// appMux: rate-limited application routes. PATCH and DELETE are both
-	// gated by the per-URL admin token, which a cross-origin page cannot
-	// read out of localStorage on this origin — the bearer token is the
-	// real CSRF defence. The X-Requested-With check stays on POST /api/shorten
-	// (which has no auth) and is intentionally NOT applied to PATCH/DELETE
-	// for consistency.
-	appMux := http.NewServeMux()
-	appMux.Handle("POST /api/shorten",
-		writeLimiter.Middleware(middleware.RequireXRequestedWith(shortenHandler)))
-	appMux.Handle("DELETE /api/url/{code}",
-		writeLimiter.Middleware(deleteHandler))
-	appMux.Handle("PATCH /api/url/{code}",
-		writeLimiter.Middleware(patchHandler))
-	appMux.Handle("GET /api/analytics/{code}", analyticsHandler)
-	appMux.Handle("GET /api/analytics/{code}/clicks", clicksHandler)
-	appMux.Handle("GET /api/qr/{code}", qrHandler)
-	appMux.Handle("GET /{code}", redirectHandler)
-	appMux.Handle("GET /static/", staticAssets.FileServer())
-	appMux.HandleFunc("GET /", staticAssets.ServeIndex)
-
-	// outerMux: probes are mounted OUTSIDE the read rate-limiter so a busy
-	// Kubernetes liveness/readiness loop can't deplete the bucket and start
-	// 429-ing real traffic. /favicon.ico likewise stops falling through to
-	// the redirect handler and counting toward the budget.
-	outerMux := http.NewServeMux()
-	outerMux.Handle("GET /healthz", healthHandler)
-	outerMux.Handle("GET /readyz", readyHandler)
-	outerMux.Handle("GET /metrics", middleware.GatedMetricsHandler(cfg.MetricsToken))
-	if cfg.MetricsToken != "" {
-		slog.Info("metrics endpoint requires bearer token (METRICS_TOKEN set)")
-	}
-	outerMux.Handle("GET /favicon.ico", handlers.FaviconHandler())
-	outerMux.Handle("/", readLimiter.Middleware(appMux))
-
-	// Middleware order (outermost → innermost):
-	//   RequestID → Logger → Metrics → Recover → SecurityHeaders → outerMux
-	//
-	// RequestID first so every log/metric carries the ID. Logger and Metrics
-	// wrap Recover so their wrapped responseWriters observe the 500 status
-	// the recover branch sets — without that, a panicked handler would be
-	// counted as 2xx and logged with status=200. SecurityHeaders sits inside
-	// Recover so the standard headers still ship on the recovered 500.
-	handler := middleware.RequestID(
-		middleware.Logger(
-			middleware.Metrics(
-				middleware.Recover(
-					middleware.SecurityHeaders(cfg.TLSEnabled())(outerMux),
-				),
-			),
-		),
-	)
 
 	server := &http.Server{
 		Addr:         cfg.Addr,
@@ -183,6 +116,43 @@ func main() {
 func fatalf(format string, args ...any) {
 	slog.Error(fmt.Sprintf(format, args...))
 	os.Exit(1)
+}
+
+// printVersion writes one line of build metadata to stdout. Prefers the
+// linker-injected buildSHA (Makefile path) and falls back to whatever
+// runtime/debug can recover from go install / module-aware builds.
+func printVersion() {
+	sha := buildSHA
+	mod := ""
+	goVer := ""
+	version := ""
+	if info, ok := debug.ReadBuildInfo(); ok {
+		goVer = info.GoVersion
+		version = info.Main.Version
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				if sha == "" && len(s.Value) >= 7 {
+					sha = s.Value[:7]
+				}
+			case "vcs.modified":
+				if s.Value == "true" {
+					mod = "+dirty"
+				}
+			}
+		}
+	}
+	if sha == "" {
+		sha = "unknown"
+	}
+	fmt.Printf("tiny-url version=%s commit=%s%s go=%s\n", or(version, "(devel)"), sha, mod, or(goVer, "unknown"))
+}
+
+func or(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func storageBackendName(backend string) string {

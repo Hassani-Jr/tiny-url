@@ -44,6 +44,12 @@ type Store interface {
 	// (CreatedAt, OwnerTokenHash, ClickCount) are preserved. Returns
 	// ErrNotFound if the code is unknown.
 	Update(code string, originalURL string, expiresAt *time.Time, clearExpiration bool) error
+	// RotateToken atomically replaces the owner-token hash for a code.
+	// The handler verifies the OLD token first; this method assumes that
+	// authorisation has already happened. Used to rotate a possibly-leaked
+	// admin token without re-creating the URL. Returns ErrNotFound if the
+	// code is unknown.
+	RotateToken(code string, newHash []byte) error
 	// Ping verifies that the backend is reachable. Used by /readyz so a
 	// liveness check (/healthz) can stay cheap while a readiness check
 	// surfaces backend outages to the load balancer.
@@ -136,6 +142,21 @@ func (s *MemoryStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 		out[i] = list[len(list)-1-i]
 	}
 	return out, nil
+}
+
+// RotateToken replaces the owner-token hash. Mutates in-place under the
+// write lock so the analytics handler's atomic read of ClickCount is
+// unaffected.
+func (s *MemoryStore) RotateToken(code string, newHash []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.urls[code]
+	if !ok {
+		return ErrNotFound
+	}
+	// Take a copy so we don't share the caller's slice backing array.
+	m.OwnerTokenHash = append([]byte(nil), newHash...)
+	return nil
 }
 
 // Update overwrites mutable fields. originalURL=="" preserves the current

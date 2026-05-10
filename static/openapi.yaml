@@ -260,6 +260,110 @@ paths:
         '410': { description: URL has expired }
         '429': { $ref: '#/components/responses/RateLimited' }
 
+  /api/url/{code}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    post:
+      tags: [URLs]
+      summary: Rotate the admin token
+      description: |
+        Issues a fresh admin token and atomically invalidates the old one.
+        Useful when a token is suspected compromised. The OLD token must
+        be presented in `Authorization` so the rotation itself is gated
+        the same way as analytics/PATCH/DELETE.
+      security:
+        - BearerToken: []
+      responses:
+        '200':
+          description: Token rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  short_code:  { type: string }
+                  admin_token: { type: string, description: New token. Save it — the old one no longer works. }
+        '401':
+          description: Missing or invalid (current) admin token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/analytics/{code}/stream:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [Analytics]
+      summary: Live click event stream (Server-Sent Events)
+      description: |
+        Owner-token-gated SSE endpoint. Pushes one `event: click` per click
+        as it happens, plus a `:heartbeat` comment every 15 seconds to keep
+        proxies / browsers from idle-closing.
+
+        The browser `EventSource` API can't set Authorization headers, so
+        the dashboard uses `fetch()` with a streaming body reader. Both
+        approaches work against this endpoint unchanged — it just emits
+        standard SSE.
+
+        SSE is best-effort presentation. Slow consumers drop events
+        rather than apply backpressure on the redirect path. The
+        canonical record is the `click_events` table (queryable via
+        `GET /api/analytics/{code}/clicks`).
+      security:
+        - BearerToken: []
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  : connected
+
+                  event: click
+                  data: {"at":"2026-05-10T12:34:56Z","ua_class":"desktop"}
+
+                  : heartbeat
+
+        '401':
+          description: Missing or invalid admin token
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/badge/{code}:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [URLs]
+      summary: Get an embeddable click-count SVG badge
+      description: |
+        Unauthenticated. Returns a shields.io-shaped SVG showing the
+        current click count for a short code. Designed to be embedded as
+        `<img src="https://your-host/api/badge/{code}.svg">` on blogs or
+        READMEs. Cached publicly for 60 seconds.
+
+        Intended for codes the owner has chosen to publicise. Anyone who
+        knows the short code can read its click count via this endpoint.
+      responses:
+        '200':
+          description: SVG badge
+          headers:
+            Cache-Control:
+              schema: { type: string, default: 'public, max-age=60' }
+          content:
+            image/svg+xml:
+              schema:
+                type: string
+                format: binary
+        '404': { description: Short code does not exist }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   /api/qr/{code}:
     parameters:
       - $ref: '#/components/parameters/Code'

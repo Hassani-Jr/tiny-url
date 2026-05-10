@@ -69,3 +69,32 @@ jobs:
           tags: tiny-url:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  fuzz:
+    name: fuzz validators (60s each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Short bursts — enough to catch new regressions, not enough to bog
+      # down PR feedback. Seed corpus + ~60s of mutation per fuzzer is the
+      # sweet spot for input-parser fuzzing in CI.
+      - name: fuzz ValidateDestinationURL
+        run: go test ./services/ -run='^$' -fuzz=FuzzValidateDestinationURL -fuzztime=60s
+
+      - name: fuzz ValidateCustomCode
+        run: go test ./services/ -run='^$' -fuzz=FuzzValidateCustomCode -fuzztime=60s
+
+      # Surface fuzz-generated corpus on failure so an operator can
+      # reproduce locally with `go test -run=FuzzXxx/<hash>`.
+      - name: upload fuzz corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: services/testdata/fuzz/

@@ -260,6 +260,28 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 	return out, rows.Err()
 }
 
+// RotateToken replaces the owner-token hash. UPDATE returns 0 rows when
+// the code doesn't exist; surface that as ErrNotFound. Authorisation is
+// the handler's responsibility — this method does not verify the OLD
+// hash before writing the new one.
+func (s *SQLiteStore) RotateToken(code string, newHash []byte) error {
+	res, err := s.db.Exec(
+		`UPDATE urls SET owner_token_hash = ? WHERE short_code = ?`,
+		newHash, code,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // Update overwrites mutable fields. The handler is expected to combine a
 // PATCH body with the current row state and submit the resulting values, so
 // this method simply runs an UPDATE and reports ErrNotFound on zero rows.
