@@ -22,11 +22,21 @@ RUN go mod download
 
 COPY . .
 
+# Build args injected by CI:
+#   VCS_REF      → short git SHA, embedded so `tiny-url --version` is useful
+#                  even when ReadBuildInfo can't recover it (the COPY .
+#                  above doesn't include the .git directory in our context).
+#   VERSION      → release tag (e.g. v1.0.0). Optional; "(devel)" otherwise.
+ARG VCS_REF=""
+ARG VERSION=""
+
 # Strip debug + symbol tables to shrink the binary; CGO off for a static link.
 # -trimpath rewrites file paths so build location doesn't leak into stack
 # traces (small but free hygiene win).
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/tiny-url .
+RUN go build -trimpath \
+    -ldflags="-s -w -X main.buildSHA=${VCS_REF} -X main.buildVersion=${VERSION}" \
+    -o /out/tiny-url .
 
 # ----------------------------------------------------------------------------
 

@@ -1,0 +1,127 @@
+name: Release
+
+# Triggered by pushing a semver tag, e.g. `git tag v1.0.0 && git push --tags`.
+# Runs the same gates as CI, then builds + pushes a multi-tag Docker image to
+# GHCR and creates a GitHub Release with auto-generated notes.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (e.g. v1.0.0)
+        required: true
+
+permissions:
+  contents: write    # create the GitHub Release
+  packages: write    # push to ghcr.io
+
+# Don't run two releases for the same tag in parallel — pre-release retries
+# and re-pushes are common and we don't want a race on the Release object.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: re-run CI gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -cover ./...
+      - run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Unformatted Go files:" && echo "$unformatted" && exit 1
+          fi
+
+  image:
+    name: build & push image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so docker/metadata-action can derive semver
+          # components (major / minor) from the tag without surprises.
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        name: derive image tags
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # For tag v1.2.3 we publish:
+          #   ghcr.io/.../tiny-url:1.2.3
+          #   ghcr.io/.../tiny-url:1.2
+          #   ghcr.io/.../tiny-url:1
+          #   ghcr.io/.../tiny-url:latest
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=tiny-url
+            org.opencontainers.image.description=Single-binary URL shortener with click analytics
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: derive release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ref=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Both build args land in the binary so `tiny-url --version`
+          # in the published image reports e.g.
+          #   version=v1.2.3 commit=a1b2c3d go=go1.25.0
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.tag.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: github release
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # generate_release_notes uses GitHub's auto-generated changelog
+          # between this tag and the previous one — fine as a default.
+          generate_release_notes: true
+          # Mark anything matching v*-rc.*, v*-alpha.*, v*-beta.* as
+          # pre-release so the "latest" badge keeps tracking stable tags.
+          prerelease: ${{ contains(github.ref_name, '-') }}

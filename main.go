@@ -17,9 +17,14 @@ import (
 )
 
 // buildSHA is set at link time via -ldflags="-X main.buildSHA=$(git rev-parse --short HEAD)"
-// (see Makefile). When unset (e.g. `go run`), `tiny-url --version` falls
-// back to whatever runtime/debug.ReadBuildInfo can recover from VCS metadata.
+// (see Makefile / Dockerfile). When unset (e.g. `go run`), `tiny-url
+// --version` falls back to whatever runtime/debug.ReadBuildInfo can recover
+// from VCS metadata.
 var buildSHA = ""
+
+// buildVersion is set at link time on tagged release builds (e.g. v1.0.0).
+// Empty otherwise; ReadBuildInfo's pseudo-version is the fallback.
+var buildVersion = ""
 
 func main() {
 	// Handle --version before doing any other work so it stays fast and
@@ -125,10 +130,12 @@ func printVersion() {
 	sha := buildSHA
 	mod := ""
 	goVer := ""
-	version := ""
+	version := buildVersion
 	if info, ok := debug.ReadBuildInfo(); ok {
 		goVer = info.GoVersion
-		version = info.Main.Version
+		if version == "" {
+			version = info.Main.Version
+		}
 		for _, s := range info.Settings {
 			switch s.Key {
 			case "vcs.revision":

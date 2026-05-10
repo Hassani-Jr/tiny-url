@@ -67,6 +67,11 @@ jobs:
           context: .
           push: false
           tags: tiny-url:ci
+          # Inject the SHA so `tiny-url --version` inside the image
+          # reports the right commit — the Docker build context omits
+          # .git so ReadBuildInfo can't otherwise recover it.
+          build-args: |
+            VCS_REF=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
