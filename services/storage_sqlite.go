@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 	"tiny-url/models"
 
@@ -19,6 +20,13 @@ import (
 type SQLiteStore struct {
 	db             *sql.DB
 	clickRetention time.Duration // 0 disables retention pruning
+	// cleanupWG tracks the StartCleanupRoutine goroutine so Close() can
+	// wait for it before tearing down the DB. Without this join, a test
+	// that defers `cancel()` and `store.Close()` would race the cleanup
+	// goroutine — it might still be running an Exec when the temp dir
+	// gets RemoveAll'd, leaving files behind and failing the test on
+	// Linux with "directory not empty".
+	cleanupWG sync.WaitGroup
 }
 
 const sqliteSchema = `
@@ -78,7 +86,19 @@ func (s *SQLiteStore) SetClickRetention(d time.Duration) {
 	s.clickRetention = d
 }
 
-func (s *SQLiteStore) Close() error { return s.db.Close() }
+// Close blocks until the cleanup goroutine (if any) has exited, then closes
+// the underlying DB. Callers MUST cancel the context passed to
+// StartCleanupRoutine before invoking Close, otherwise this will block
+// forever waiting for the goroutine that's still polling.
+//
+// The join matters because the cleanup goroutine holds a connection
+// reference and may have files open inside the SQLite WAL; closing the DB
+// while it's mid-Exec leaves the WAL/SHM sidecars in a state that confuses
+// downstream cleanup (notably t.TempDir's RemoveAll on Linux CI).
+func (s *SQLiteStore) Close() error {
+	s.cleanupWG.Wait()
+	return s.db.Close()
+}
 
 func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	var expiresAt sql.NullInt64
@@ -331,13 +351,22 @@ func (s *SQLiteStore) Update(code string, originalURL string, expiresAt *time.Ti
 
 func (s *SQLiteStore) StartCleanupRoutine(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
+	s.cleanupWG.Add(1)
 	go func() {
+		defer s.cleanupWG.Done()
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
+				// Bail out if cancellation arrived between ticks — Go's
+				// select picks randomly when both channels are ready, so
+				// without this guard we could run one more Exec after
+				// Close has already been signalled to wait on us.
+				if ctx.Err() != nil {
+					return
+				}
 				if _, err := s.db.ExecContext(ctx,
 					`DELETE FROM urls WHERE expires_at IS NOT NULL AND expires_at < ?`,
 					now.UnixNano(),
