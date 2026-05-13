@@ -47,7 +47,7 @@ func (h *AnalyticsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !authorizeOwner(r, urlMapping.OwnerTokenHash) {
+	if !authorizeAccess(r, urlMapping, h.storage) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 		return
 	}
@@ -62,6 +62,7 @@ func (h *AnalyticsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Tags:         urlMapping.Tags,
 		MaxClicks:    urlMapping.MaxClicks,
 		HasPassword:  len(urlMapping.PasswordHash) > 0,
+		WebhookURL:   urlMapping.WebhookURL,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

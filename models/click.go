@@ -15,4 +15,10 @@ type ClickEvent struct {
 	IPHash  string    `json:"ip_hash,omitempty"`  // hex SHA-256 of IP+salt; "" when CLICK_LOG_IP=false
 	Referer string    `json:"referer,omitempty"`  // truncated to MaxRefererLength
 	UAClass string    `json:"ua_class,omitempty"` // "bot" | "mobile" | "tablet" | "desktop" | "unknown"
+	// Country is an ISO-3166-1 alpha-2 code resolved from the client IP
+	// at click time via the embedded GeoLite2 database. Empty when geoip
+	// is disabled, the IP isn't in the DB, or the IP couldn't be parsed.
+	// Country is coarse enough to keep the privacy posture (no city, no
+	// lat/lon, no ASN).
+	Country string `json:"country,omitempty"`
 }

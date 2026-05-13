@@ -27,6 +27,18 @@ type URLMapping struct {
 	// PasswordSalt is a per-URL 16-byte random salt for PasswordHash. Empty
 	// iff PasswordHash is empty.
 	PasswordSalt []byte
+	// WebhookURL, when non-empty, is the HTTP endpoint the server POSTs to
+	// after each successful click. Same SSRF rules as OriginalURL apply
+	// (no private/loopback hosts). Server-generated WebhookSecret is the
+	// HMAC-SHA256 key for the X-Tinyurl-Signature header on every delivery.
+	WebhookURL    string
+	WebhookSecret []byte
+	// APIKeyID, when non-zero, is the ID of the API key that owns this
+	// URL. The URL can be managed via either its per-URL admin token OR
+	// the API key — both credentials work at all owner-gated endpoints.
+	// Zero means "not associated with any API key"; the per-URL admin
+	// token is the only credential.
+	APIKeyID int64
 }
 
 // ShortenRequest represents the request to create a shortened URL
@@ -37,18 +49,21 @@ type ShortenRequest struct {
 	Tags           []string `json:"tags,omitempty"`            // Optional labels; opaque to server
 	MaxClicks      int64    `json:"max_clicks,omitempty"`      // Optional cap; 0 = unlimited
 	Password       string   `json:"password,omitempty"`        // Optional passphrase; gates redirect
+	WebhookURL     string   `json:"webhook_url,omitempty"`     // Optional click webhook target
 }
 
 // ShortenResponse represents the response containing the shortened URL
 type ShortenResponse struct {
-	ShortCode   string     `json:"short_code"`
-	ShortURL    string     `json:"short_url"`
-	OriginalURL string     `json:"original_url"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	AdminToken  string     `json:"admin_token"` // returned once; required to read analytics for this code
-	Tags        []string   `json:"tags,omitempty"`
-	MaxClicks   int64      `json:"max_clicks,omitempty"`
-	HasPassword bool       `json:"has_password,omitempty"`
+	ShortCode     string     `json:"short_code"`
+	ShortURL      string     `json:"short_url"`
+	OriginalURL   string     `json:"original_url"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	AdminToken    string     `json:"admin_token"` // returned once; required to read analytics for this code
+	Tags          []string   `json:"tags,omitempty"`
+	MaxClicks     int64      `json:"max_clicks,omitempty"`
+	HasPassword   bool       `json:"has_password,omitempty"`
+	WebhookURL    string     `json:"webhook_url,omitempty"`
+	WebhookSecret string     `json:"webhook_secret,omitempty"` // returned once when a webhook is configured; HMAC-SHA256 key
 }
 
 // AnalyticsResponse represents analytics data for a shortened URL.
@@ -64,6 +79,10 @@ type AnalyticsResponse struct {
 	Tags         []string   `json:"tags,omitempty"`
 	MaxClicks    int64      `json:"max_clicks,omitempty"`
 	HasPassword  bool       `json:"has_password"`
+	// WebhookURL is exposed (without the secret) so owners can see what's
+	// configured. The secret was shown ONCE at create/rotate time and is
+	// never returned again; lost secrets require a webhook rotation.
+	WebhookURL string `json:"webhook_url,omitempty"`
 }
 
 // ErrorResponse represents an error response

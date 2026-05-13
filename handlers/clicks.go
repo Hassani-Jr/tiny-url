@@ -55,7 +55,7 @@ func (h *ClicksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !authorizeOwner(r, urlMapping.OwnerTokenHash) {
+	if !authorizeAccess(r, urlMapping, h.storage) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 		return
 	}

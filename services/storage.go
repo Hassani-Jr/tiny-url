@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,32 @@ type Store interface {
 	Ping(ctx context.Context) error
 	StartCleanupRoutine(ctx context.Context, interval time.Duration)
 	Close() error
+
+	// API key CRUD. Distinct from URL CRUD because keys have their own
+	// lifecycle and the URL-side authorization path may resolve a key
+	// hash → ID independently from URL lookups.
+	//
+	// CreateAPIKey inserts a fresh key and returns its assigned ID + a
+	// fully-populated model (CreatedAt, etc.). The store hashes the
+	// token before persisting; the caller never sees the stored bytes.
+	CreateAPIKey(label string, tokenHash []byte) (*models.APIKey, error)
+	// LookupAPIKey finds the key whose token hash matches the supplied
+	// bytes. Returns ErrNotFound if no key matches. Also updates
+	// last_used_at as a side effect — best-effort; a write failure here
+	// is logged but does not fail the lookup.
+	LookupAPIKey(tokenHash []byte) (*models.APIKey, error)
+	// GetAPIKey fetches by ID; used after a successful auth to populate
+	// PATCH/DELETE response bodies without rehashing the token.
+	GetAPIKey(id int64) (*models.APIKey, error)
+	// DeleteAPIKey removes the key. URLs that referenced it via
+	// api_key_id are NOT deleted; the column is cleared so the per-URL
+	// admin token remains the only credential.
+	DeleteAPIKey(id int64) error
+	// UpdateAPIKeyLabel changes the label without touching the hash.
+	UpdateAPIKeyLabel(id int64, label string) error
+	// ListURLsByAPIKey returns the URLs whose api_key_id == id, newest
+	// first, paginated. Used by GET /api/urls.
+	ListURLsByAPIKey(id int64, limit, offset int) ([]*models.URLMapping, error)
 }
 
 // UpdateFields is the patch payload passed to Store.Update. Pointer fields
@@ -80,6 +107,17 @@ type UpdateFields struct {
 	PasswordHash    []byte
 	PasswordSalt    []byte
 	ClearPassword   bool
+	// WebhookURL / WebhookSecret are set as a pair when adding or rotating
+	// a webhook; ClearWebhook drops both. Setting either separately would
+	// leave the row in an inconsistent state, so the handler always passes
+	// both or neither.
+	WebhookURL    *string
+	WebhookSecret []byte
+	ClearWebhook  bool
+	// APIKeyID transfers (or clears, with 0) ownership of the URL to the
+	// given API key. Pointer because 0 means "clear" — distinguishing
+	// that from "leave alone" needs the explicit-nil convention.
+	APIKeyID *int64
 }
 
 // memoryClickCapPerCode bounds the in-memory event log per short code so a
@@ -93,13 +131,19 @@ type MemoryStore struct {
 	urls   map[string]*models.URLMapping
 	events map[string][]models.ClickEvent // per-code FIFO ring, capped at memoryClickCapPerCode
 	mu     sync.RWMutex
+
+	// API key state. nextKeyID is bumped on every CreateAPIKey so IDs
+	// match the SQLite AUTOINCREMENT contract (monotonic, never reused).
+	apiKeys   map[int64]*models.APIKey
+	nextKeyID int64
 }
 
 // NewMemoryStore creates an empty MemoryStore.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		urls:   make(map[string]*models.URLMapping),
-		events: make(map[string][]models.ClickEvent),
+		urls:    make(map[string]*models.URLMapping),
+		events:  make(map[string][]models.ClickEvent),
+		apiKeys: make(map[int64]*models.APIKey),
 	}
 }
 
@@ -217,7 +261,146 @@ func (s *MemoryStore) Update(code string, f UpdateFields) error {
 		m.PasswordHash = append([]byte(nil), f.PasswordHash...)
 		m.PasswordSalt = append([]byte(nil), f.PasswordSalt...)
 	}
+	switch {
+	case f.ClearWebhook:
+		m.WebhookURL = ""
+		m.WebhookSecret = nil
+	case f.WebhookURL != nil:
+		m.WebhookURL = *f.WebhookURL
+		if f.WebhookSecret != nil {
+			m.WebhookSecret = append([]byte(nil), f.WebhookSecret...)
+		}
+	}
+	if f.APIKeyID != nil {
+		m.APIKeyID = *f.APIKeyID
+	}
 	return nil
+}
+
+// CreateAPIKey inserts a new API key. ID is auto-assigned by the
+// monotonic counter; CreatedAt is stamped server-side so the caller
+// can't backdate.
+func (s *MemoryStore) CreateAPIKey(label string, tokenHash []byte) (*models.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextKeyID++
+	k := &models.APIKey{
+		ID:        s.nextKeyID,
+		TokenHash: append([]byte(nil), tokenHash...),
+		Label:     label,
+		CreatedAt: time.Now(),
+	}
+	s.apiKeys[k.ID] = k
+	return k, nil
+}
+
+// LookupAPIKey walks the map to find a hash match. Linear in the key
+// count; the typical install has at most a handful of keys so this is
+// fine. SQLite uses an index for the same query at scale.
+func (s *MemoryStore) LookupAPIKey(tokenHash []byte) (*models.APIKey, error) {
+	s.mu.Lock() // write lock — we update last_used_at on hit
+	defer s.mu.Unlock()
+	for _, k := range s.apiKeys {
+		if bytesEqualConstTime(k.TokenHash, tokenHash) {
+			now := time.Now()
+			k.LastUsedAt = &now
+			return k, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// bytesEqualConstTime is a minimal constant-time byte compare. Avoids
+// pulling crypto/subtle into the storage layer; the inputs are
+// 32-byte SHA-256 outputs so the timing leak window is microscopic
+// anyway, but constant-time keeps the property crisp.
+func bytesEqualConstTime(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var v byte
+	for i := range a {
+		v |= a[i] ^ b[i]
+	}
+	return v == 0
+}
+
+func (s *MemoryStore) GetAPIKey(id int64) (*models.APIKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k, ok := s.apiKeys[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return k, nil
+}
+
+func (s *MemoryStore) DeleteAPIKey(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.apiKeys[id]; !ok {
+		return ErrNotFound
+	}
+	delete(s.apiKeys, id)
+	// Clear api_key_id on any URLs that referenced this key — the
+	// per-URL admin token remains a valid credential, so the URLs are
+	// not orphaned, just disassociated from the deleted key.
+	for _, u := range s.urls {
+		if u.APIKeyID == id {
+			u.APIKeyID = 0
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) UpdateAPIKeyLabel(id int64, label string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	k.Label = label
+	return nil
+}
+
+// ListURLsByAPIKey returns URLs whose api_key_id == id, newest first
+// (by CreatedAt). Pagination is via limit/offset; limit<=0 falls back
+// to 50.
+func (s *MemoryStore) ListURLsByAPIKey(id int64, limit, offset int) ([]*models.URLMapping, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = 50
+	}
+	var matched []*models.URLMapping
+	for _, u := range s.urls {
+		if u.APIKeyID == id {
+			matched = append(matched, u)
+		}
+	}
+	// Newest first.
+	sortByCreatedAtDesc(matched)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(matched) {
+		return []*models.URLMapping{}, nil
+	}
+	end := offset + limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[offset:end], nil
+}
+
+// sortByCreatedAtDesc sorts in place by CreatedAt descending. Standard
+// sort.Slice — the matched list can grow with the user's URL count, so
+// we want O(N log N).
+func sortByCreatedAtDesc(list []*models.URLMapping) {
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].CreatedAt.After(list[j].CreatedAt)
+	})
 }
 
 // ClicksByBucket walks the in-memory event log and aggregates into

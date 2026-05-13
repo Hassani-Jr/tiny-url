@@ -38,6 +38,16 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 
 	clickStream := services.NewClickStream()
 	dnsCache := services.NewDNSCache(5*time.Second, 1024)
+	geoIP := services.NewGeoIP()
+	webhookDispatcher := services.NewWebhookDispatcher(
+		cfg.WebhookWorkers, cfg.WebhookQueueSize, cfg.WebhookTimeout,
+	)
+	// Tied to the request-handling lifecycle: stop accepting deliveries
+	// and drain the queue once the parent context (SIGTERM) fires.
+	go func() {
+		<-ctx.Done()
+		webhookDispatcher.Close()
+	}()
 
 	staticAssets, err := handlers.NewStaticAssets(staticDirFS())
 	if err != nil {
@@ -51,6 +61,8 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 		LogIP:      cfg.LogClickIP,
 		Stream:     clickStream,
 		DNSCache:   dnsCache,
+		Webhook:    webhookDispatcher,
+		GeoIP:      geoIP,
 	})
 	streamHandler := handlers.NewStreamHandler(store, clickStream)
 	analyticsHandler := handlers.NewAnalyticsHandler(store)
@@ -63,6 +75,8 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	qrHandler := handlers.NewQRHandler(store, cfg.BaseURL)
 	healthHandler := handlers.NewHealthHandler(storageBackendName(cfg.StorageBackend))
 	readyHandler := handlers.NewReadyHandler(store, 2*time.Second)
+	apiKeyHandler := handlers.NewAPIKeyHandler(store)
+	myURLsHandler := handlers.NewMyURLsHandler(store, 100)
 
 	writeLimiter := middleware.NewLimiter(ctx, cfg.WriteRatePerMin, time.Minute, cfg.TrustProxy)
 	readLimiter := middleware.NewLimiter(ctx, cfg.ReadRatePerMin, time.Minute, cfg.TrustProxy)
@@ -82,6 +96,16 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 		writeLimiter.Middleware(patchHandler))
 	appMux.Handle("POST /api/url/{code}/rotate",
 		writeLimiter.Middleware(rotateHandler))
+	// /api/keys: POST creates (mints a fresh API key), the others
+	// require a valid bearer that resolves to a stored key. POST is on
+	// the write limiter + XHR header (matches /api/shorten); read paths
+	// fall through the read limiter only.
+	appMux.Handle("POST /api/keys",
+		writeLimiter.Middleware(middleware.RequireXRequestedWith(apiKeyHandler)))
+	appMux.Handle("GET /api/keys", apiKeyHandler)
+	appMux.Handle("PATCH /api/keys", apiKeyHandler)
+	appMux.Handle("DELETE /api/keys", apiKeyHandler)
+	appMux.Handle("GET /api/urls", myURLsHandler)
 	appMux.Handle("GET /api/analytics/{code}", analyticsHandler)
 	appMux.Handle("GET /api/analytics/{code}/clicks", clicksHandler)
 	appMux.Handle("GET /api/analytics/{code}/series", seriesHandler)

@@ -56,6 +56,13 @@ type Config struct {
 	// token check. Empty (the default) leaves /metrics open — fine if the
 	// endpoint is firewalled or only reachable on a private network.
 	MetricsToken string
+	// WebhookWorkers / WebhookQueueSize / WebhookTimeout configure the
+	// async webhook dispatcher. Defaults keep memory/CPU small at the
+	// cost of dropping deliveries under sustained burst — operators with
+	// hot links should raise the queue size.
+	WebhookWorkers   int
+	WebhookQueueSize int
+	WebhookTimeout   time.Duration
 }
 
 // Load reads configuration from environment variables, falling back to safe defaults.
@@ -81,6 +88,9 @@ func Load() Config {
 		ClickIPSalt:          os.Getenv("CLICK_IP_SALT"),
 		ClickRetentionDays:   getEnvInt("CLICK_RETENTION_DAYS", 90),
 		MetricsToken:         os.Getenv("METRICS_TOKEN"),
+		WebhookWorkers:       getEnvInt("WEBHOOK_WORKERS", 4),
+		WebhookQueueSize:     getEnvInt("WEBHOOK_QUEUE", 256),
+		WebhookTimeout:       time.Duration(getEnvInt("WEBHOOK_TIMEOUT_MS", 5000)) * time.Millisecond,
 	}
 }
 

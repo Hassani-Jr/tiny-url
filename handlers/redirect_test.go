@@ -305,6 +305,75 @@ func TestRedirectHandlerCustomCode(t *testing.T) {
 	}
 }
 
+func TestRedirectFiresWebhook(t *testing.T) {
+	// Mapping with a webhook configured should cause the dispatcher to
+	// receive an event after a successful click. The actual HTTP delivery
+	// is tested in services/webhook_test.go; here we only check the
+	// redirect → dispatcher wiring.
+	store := services.NewMemoryStore()
+
+	type wantEvent struct {
+		code, url string
+		secret    []byte
+		payload   []byte
+	}
+	received := make(chan wantEvent, 1)
+
+	// Spin up a real WebhookDispatcher with a no-op validator and a
+	// custom transport that captures the event before it would go out
+	// over the wire. Simpler than mocking: we run a tiny httptest server
+	// that records the body and signature.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		received <- wantEvent{
+			code:    r.Header.Get("X-Tinyurl-Code"),
+			url:     r.URL.String(),
+			payload: buf[:n],
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := services.NewWebhookDispatcher(1, 8, 2*time.Second)
+	// Override the internal validator so 127.0.0.1 (httptest binds there)
+	// is accepted. The exported field would have been nice but the test
+	// is in the same package as the handler, not the service, so we use
+	// a helper that lives next to the dispatcher.
+	services.SetWebhookHostValidator(d, func(string) error { return nil })
+	t.Cleanup(d.Close)
+
+	handler := NewRedirectHandler(store, RedirectConfig{Webhook: d})
+	mux := http.NewServeMux()
+	mux.Handle("GET /{code}", handler)
+
+	store.Set("hk", &models.URLMapping{
+		ID:            "hk",
+		OriginalURL:   "https://1.1.1.1/",
+		CreatedAt:     time.Now(),
+		WebhookURL:    srv.URL + "/recv",
+		WebhookSecret: []byte("topsecret"),
+	})
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/hk", nil))
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+
+	select {
+	case ev := <-received:
+		if ev.code != "hk" {
+			t.Errorf("X-Tinyurl-Code = %q, want hk", ev.code)
+		}
+		if !strings.Contains(string(ev.payload), `"short_code":"hk"`) {
+			t.Errorf("payload missing short_code: %s", ev.payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook never received")
+	}
+}
+
 func TestRedirectClickCap(t *testing.T) {
 	// A URL with MaxClicks=2 should redirect twice, then return 410 Gone
 	// without serving the destination URL or recording a click event.

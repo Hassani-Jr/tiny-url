@@ -19,6 +19,7 @@
     const TOKEN_PREFIX = 'tinyurl:token:';
     const LABEL_PREFIX = 'tinyurl:label:';
     const THEME_KEY    = 'tinyurl:theme';
+    const APIKEY_KEY   = 'tinyurl:apikey'; // raw key value, persisted across sessions
     const REFRESH_MS   = 30_000;
     const TOAST_MS     = 3500;
     const FLASH_MS     = 2500;
@@ -60,8 +61,24 @@
         tagsInput:      $('tagsInput'),
         maxClicksInput: $('maxClicksInput'),
         passwordInput:  $('passwordInput'),
+        webhookInput:   $('webhookInput'),
         cancelCreateBtn:$('cancelCreateBtn'),
         createBtn:      $('createBtn'),
+
+        keyBtn:            $('keyBtn'),
+        keyPanel:          $('keyPanel'),
+        keyActiveBlock:    $('keyActiveBlock'),
+        keyValue:          $('keyValue'),
+        keyLabel:          $('keyLabel'),
+        keyCopyBtn:        $('keyCopyBtn'),
+        keyRevokeBtn:      $('keyRevokeBtn'),
+        keyClearBtn:       $('keyClearBtn'),
+        keyCreateForm:     $('keyCreateForm'),
+        keyLabelInput:     $('keyLabelInput'),
+        keyPasteInput:     $('keyPasteInput'),
+        keyCancelBtn:      $('keyCancelBtn'),
+        keyPasteBtn:       $('keyPasteBtn'),
+        keyCreateBtn:      $('keyCreateBtn'),
 
         importPanel:      $('importPanel'),
         importForm:       $('importForm'),
@@ -98,6 +115,13 @@
     let sortKey = 'last_accessed';
     let sortDir = 'desc';
     let currentRange = '24h';
+    /**
+     * apiKey: when non-empty, the dashboard is in "API key mode" — every
+     * fetch uses this key as the bearer, and loadAll() pulls from
+     * GET /api/urls instead of iterating per-URL admin tokens. Stored
+     * in localStorage so it survives reloads.
+     */
+    let apiKey = '';
     const expanded = new Set();
     /** Codes currently checked for bulk operations. */
     const selected = new Set();
@@ -176,6 +200,64 @@
         setTimeout(() => dismissToast(node), lifetime);
         return node;
     }
+    /**
+     * Show the freshly-issued webhook secret with a copy button. The
+     * server returns each secret ONCE (mirrors the admin_token flow);
+     * after this toast disappears the user must rotate to see a new
+     * value. Stays open for a long time so it's hard to miss.
+     */
+    function showWebhookSecret(code, secret) {
+        const node = document.createElement('div');
+        node.className = 'toast toast-info';
+        node.style.alignItems = 'flex-start';
+        node.style.flexDirection = 'column';
+        node.style.gap = '0.4rem';
+
+        const title = document.createElement('strong');
+        title.textContent = `/${code} — webhook secret (shown once)`;
+        node.appendChild(title);
+
+        const codeEl = document.createElement('code');
+        codeEl.textContent = secret;
+        codeEl.style.userSelect = 'all';
+        codeEl.style.wordBreak = 'break-all';
+        codeEl.style.fontSize = '0.78rem';
+        node.appendChild(codeEl);
+
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '0.4rem';
+        row.style.width = '100%';
+
+        const copy = document.createElement('button');
+        copy.type = 'button';
+        copy.className = 'toast-action';
+        copy.textContent = 'Copy';
+        copy.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                await navigator.clipboard.writeText(secret);
+                copy.textContent = 'Copied';
+            } catch (_) {
+                copy.textContent = 'Copy failed';
+            }
+        });
+        row.appendChild(copy);
+
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'toast-action';
+        close.textContent = 'Dismiss';
+        close.addEventListener('click', (e) => { e.stopPropagation(); dismissToast(node); });
+        row.appendChild(close);
+
+        node.appendChild(row);
+        els.toastContainer.appendChild(node);
+        // 60s so the user has enough time to copy into their downstream
+        // env file without dismissing prematurely.
+        setTimeout(() => dismissToast(node), 60_000);
+    }
+
     function dismissToast(node) {
         if (!node || !node.parentNode) return;
         node.classList.add('fading');
@@ -242,38 +324,83 @@
         }
     }
 
-    async function apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password }) {
+    async function apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url }) {
         const body = { url };
         if (custom_code) body.custom_code = custom_code;
         if (expiration_mins) body.expiration_mins = expiration_mins;
         if (tags && tags.length) body.tags = tags;
         if (max_clicks) body.max_clicks = max_clicks;
         if (password) body.password = password;
+        if (webhook_url) body.webhook_url = webhook_url;
+        const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
+        // Authenticate the create request when an API key is active so
+        // the server claims ownership for that key (api_key_id is set
+        // on the new row).
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
         const r = await fetch('/api/shorten', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            headers,
             body: JSON.stringify(body),
         });
         const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data.message || `Create failed (${r.status})`);
         return data;
     }
+    /**
+     * Bearer resolver. Prefers the global API key when set; falls back
+     * to the per-URL admin token. Returning the key everywhere means
+     * the per-URL token still works for URLs not owned by this key
+     * (the server resolves both credentials).
+     */
+    function bearerFor(perURLToken) {
+        return apiKey || perURLToken || '';
+    }
+
+    async function apiCreateKey(label) {
+        const r = await fetch('/api/keys', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ label }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.message || `Create key failed (${r.status})`);
+        return data;
+    }
+    async function apiGetKey(key) {
+        const r = await fetch('/api/keys', { headers: { 'Authorization': `Bearer ${key}` } });
+        if (r.status === 401) return null;
+        if (!r.ok) throw new Error(`Get key failed (${r.status})`);
+        return r.json();
+    }
+    async function apiRevokeKey(key) {
+        const r = await fetch('/api/keys', {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${key}` },
+        });
+        if (!r.ok && r.status !== 204) throw new Error(`Revoke failed (${r.status})`);
+    }
+    async function apiListMyURLs(key) {
+        const r = await fetch('/api/urls', { headers: { 'Authorization': `Bearer ${key}` } });
+        if (!r.ok) throw new Error(`List failed (${r.status})`);
+        return r.json();
+    }
+
     async function apiSeries(code, token, bucket = 'hour', range = 24) {
         const r = await fetch(`/api/analytics/${encodeURIComponent(code)}/series?bucket=${bucket}&range=${range}`, {
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 'Authorization': `Bearer ${bearerFor(token)}` },
         });
         if (!r.ok) throw new Error(`Series fetch failed (${r.status})`);
         return r.json();
     }
     async function apiAnalytics(code, token) {
         const r = await fetch(`/api/analytics/${encodeURIComponent(code)}`, {
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 'Authorization': `Bearer ${bearerFor(token)}` },
         });
         return { status: r.status, data: r.status === 200 ? await r.json() : null };
     }
     async function apiClicks(code, token, limit = 50) {
         const r = await fetch(`/api/analytics/${encodeURIComponent(code)}/clicks?limit=${limit}`, {
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 'Authorization': `Bearer ${bearerFor(token)}` },
         });
         if (!r.ok) throw new Error(`Clicks fetch failed (${r.status})`);
         return r.json();
@@ -283,7 +410,7 @@
             method: 'PATCH',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`,
+                'Authorization': `Bearer ${bearerFor(token)}`,
             },
             body: JSON.stringify(body),
         });
@@ -294,14 +421,14 @@
     async function apiDelete(code, token) {
         const r = await fetch(`/api/url/${encodeURIComponent(code)}`, {
             method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 'Authorization': `Bearer ${bearerFor(token)}` },
         });
         return r.status;
     }
     async function apiRotate(code, token) {
         const r = await fetch(`/api/url/${encodeURIComponent(code)}/rotate`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` },
+            headers: { 'Authorization': `Bearer ${bearerFor(token)}` },
         });
         const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data.message || `Rotate failed (${r.status})`);
@@ -326,9 +453,34 @@
     // ---------- data loading ----------------------------------------------
 
     async function loadAll() {
+        // API-key mode: a single /api/urls call gives us every URL the
+        // key owns, no need to iterate localStorage tokens. The legacy
+        // path below still runs alongside so URLs not owned by the key
+        // (e.g. imports created before account mode) keep working.
+        if (apiKey) {
+            try {
+                const data = await apiListMyURLs(apiKey);
+                for (const u of (data.urls || [])) {
+                    rows.set(u.short_code, {
+                        code: u.short_code,
+                        token: '', // API key auths everything
+                        status: 'active',
+                        data: u,
+                    });
+                    detectActivity(u.short_code, u);
+                }
+            } catch (e) {
+                toast(`API key list failed: ${e.message}`, 'error');
+            }
+        }
+
         const tokens = tokensFromStorage();
-        if (tokens.length === 0) {
+        if (tokens.length === 0 && rows.size === 0) {
             rows.clear();
+            render();
+            return;
+        }
+        if (tokens.length === 0) {
             render();
             return;
         }
@@ -875,7 +1027,48 @@
             }
             wrap.appendChild(ul);
         }
+
+        // Country breakdown. Empty country values (geoip disabled or no
+        // match) are folded into "Unknown" so the section only renders
+        // when there's something useful to show; if every event is
+        // unknown we suppress the heading entirely.
+        const countries = countBy(events, (e) => e.country || '');
+        const nonEmpty = Array.from(countries.entries()).filter(([k]) => k !== '');
+        if (nonEmpty.length) {
+            const h = document.createElement('h3');
+            h.textContent = 'Top countries';
+            h.style.marginTop = '0.75rem';
+            wrap.appendChild(h);
+            const ul = document.createElement('ul');
+            ul.className = 'device-list';
+            const top = nonEmpty.sort((a, b) => b[1] - a[1]).slice(0, 5);
+            for (const [cc, n] of top) {
+                const li = document.createElement('li');
+                const left = document.createElement('span');
+                left.textContent = `${flagEmoji(cc)} ${cc}`;
+                const right = document.createElement('span');
+                right.className = 'dev-count';
+                right.textContent = String(n);
+                li.appendChild(left); li.appendChild(right);
+                ul.appendChild(li);
+            }
+            wrap.appendChild(ul);
+        }
         return wrap;
+    }
+
+    /**
+     * Convert a 2-letter ISO country code into the corresponding regional-
+     * indicator flag emoji. Browsers without flag-emoji fonts (notably
+     * Windows Chrome) just render the letters, which is still readable.
+     */
+    function flagEmoji(cc) {
+        if (!cc || cc.length !== 2) return '';
+        const base = 0x1F1E6 - 'A'.charCodeAt(0);
+        const c1 = cc.charCodeAt(0);
+        const c2 = cc.charCodeAt(1);
+        if (c1 < 65 || c1 > 90 || c2 < 65 || c2 > 90) return '';
+        return String.fromCodePoint(base + c1, base + c2);
     }
 
     /**
@@ -956,11 +1149,36 @@
             row.data?.has_password ? 'Replace password (leave blank to keep, "off" to clear)' : 'Set password',
             'text', '');
         pwField.input.placeholder = row.data?.has_password ? 'leave blank to keep' : '';
+        const hookField = makeField(
+            row.data?.webhook_url ? 'Webhook URL ("off" to clear, blank to keep)' : 'Webhook URL',
+            'url', row.data?.webhook_url || '');
         wrap.appendChild(urlField.field);
         wrap.appendChild(expField.field);
         wrap.appendChild(tagsField.field);
         wrap.appendChild(maxField.field);
         wrap.appendChild(pwField.field);
+        wrap.appendChild(hookField.field);
+        if (row.data?.webhook_url) {
+            // Surface a "rotate secret" affordance only when there's an
+            // existing webhook to rotate against. Clicking issues a PATCH
+            // with webhook_rotate_secret=true and shows the new key once.
+            const rot = makeBtn('Rotate webhook secret', 'btn btn-ghost btn-sm', async (e) => {
+                e.preventDefault();
+                if (!confirm('Issue a new webhook secret? The current secret will stop verifying immediately.')) return;
+                try {
+                    const data = await apiPatch(row.code, row.token, { webhook_rotate_secret: true });
+                    if (data.webhook_secret) {
+                        showWebhookSecret(row.code, data.webhook_secret);
+                    } else {
+                        toast('Rotation succeeded but server did not return a secret.', 'error');
+                    }
+                } catch (err) {
+                    toast(err.message, 'error');
+                }
+            });
+            rot.style.marginTop = '0.4rem';
+            wrap.appendChild(rot);
+        }
 
         const actions = document.createElement('div');
         actions.className = 'form-actions';
@@ -994,15 +1212,27 @@
             if (pwVal === 'off') body.password = '';
             else if (pwVal !== '') body.password = pwVal;
 
+            // Webhook URL semantics mirror the password field.
+            const hookVal = hookField.input.value.trim();
+            const curHook = row.data?.webhook_url || '';
+            if (hookVal === 'off') body.webhook_url = '';
+            else if (hookVal !== '' && hookVal !== curHook) body.webhook_url = hookVal;
+
             if (Object.keys(body).length === 0) {
                 toast('Nothing to save.', 'info');
                 return;
             }
             try {
-                await apiPatch(row.code, row.token, body);
+                const data = await apiPatch(row.code, row.token, body);
                 toast(`/${row.code} updated.`, 'success');
                 expField.input.value = '';
                 pwField.input.value = '';
+                // PATCH returns a fresh secret only when the webhook was
+                // added or rotated server-side. Show it inline when it
+                // does — same one-shot contract as creation.
+                if (data && data.webhook_secret) {
+                    showWebhookSecret(row.code, data.webhook_secret);
+                }
                 refreshOne(row.code);
             } catch (err) {
                 toast(err.message, 'error');
@@ -1203,7 +1433,7 @@
         (async () => {
             try {
                 const resp = await fetch(`/api/analytics/${encodeURIComponent(code)}/stream`, {
-                    headers: { 'Authorization': `Bearer ${row.token}` },
+                    headers: { 'Authorization': `Bearer ${bearerFor(row.token)}` },
                     signal: controller.signal,
                 });
                 if (!resp.ok || !resp.body) return; // 401/404/410 etc.
@@ -1306,6 +1536,118 @@
         return RTF.format(Math.round(value), unit);
     }
 
+    // ---------- API key flow ----------------------------------------------
+
+    /**
+     * Read the API key from localStorage on startup. Validates against
+     * the server with GET /api/keys — a stale/revoked key is cleared so
+     * the dashboard doesn't keep sending an invalid bearer.
+     */
+    async function initAPIKey() {
+        let stored = '';
+        try { stored = localStorage.getItem(APIKEY_KEY) || ''; } catch (_) {}
+        if (!stored) return;
+        try {
+            const meta = await apiGetKey(stored);
+            if (!meta) {
+                try { localStorage.removeItem(APIKEY_KEY); } catch (_) {}
+                toast('Saved API key was rejected by the server and has been removed.', 'info');
+                return;
+            }
+            apiKey = stored;
+        } catch (_) {
+            // Network or 5xx: keep the key, retry on next user action.
+            apiKey = stored;
+        }
+        renderKeyPanel();
+    }
+
+    function openKeyPanel() {
+        closeCreate(); closeImport();
+        els.keyPanel.classList.remove('hidden');
+        renderKeyPanel();
+    }
+    function closeKeyPanel() {
+        els.keyPanel.classList.add('hidden');
+    }
+
+    function renderKeyPanel() {
+        if (!els.keyPanel) return;
+        const active = !!apiKey;
+        els.keyActiveBlock.classList.toggle('hidden', !active);
+        if (active) {
+            els.keyValue.textContent = apiKey;
+            // Best-effort metadata fetch — failure is fine, the user
+            // still sees the raw key value.
+            apiGetKey(apiKey).then((m) => {
+                if (m && els.keyLabel) els.keyLabel.textContent = m.label || '(no label)';
+            }).catch(() => {});
+        }
+    }
+
+    async function submitCreateKey(e) {
+        e.preventDefault();
+        const label = els.keyLabelInput.value.trim();
+        try {
+            const data = await apiCreateKey(label);
+            useAPIKey(data.token);
+            els.keyLabelInput.value = '';
+            toast(`API key created (id ${data.id}). Saved in this browser.`, 'success');
+            renderKeyPanel();
+            // Pull the URL list with the new key right away so the table
+            // populates without waiting for the next periodic refresh.
+            loadAll();
+        } catch (err) {
+            toast(err.message, 'error');
+        }
+    }
+
+    async function pasteAPIKey() {
+        const v = els.keyPasteInput.value.trim();
+        if (!v) { toast('Paste a key first.', 'error'); return; }
+        try {
+            const meta = await apiGetKey(v);
+            if (!meta) {
+                toast('That key was rejected by the server.', 'error');
+                return;
+            }
+            useAPIKey(v);
+            els.keyPasteInput.value = '';
+            toast(`API key accepted (id ${meta.id}).`, 'success');
+            renderKeyPanel();
+            loadAll();
+        } catch (err) {
+            toast(err.message, 'error');
+        }
+    }
+
+    function useAPIKey(v) {
+        apiKey = v;
+        try { localStorage.setItem(APIKEY_KEY, v); } catch (_) {}
+    }
+
+    function clearAPIKey() {
+        apiKey = '';
+        try { localStorage.removeItem(APIKEY_KEY); } catch (_) {}
+        renderKeyPanel();
+        // Drop server-listed rows; localStorage admin tokens remain.
+        rows.clear();
+        loadAll();
+        toast('API key forgotten on this device. URLs not in localStorage are gone from this view.', 'info');
+    }
+
+    async function revokeAPIKey() {
+        if (!apiKey) return;
+        if (!confirm('Revoke this key on the server? URLs survive but lose their account binding.')) return;
+        try {
+            await apiRevokeKey(apiKey);
+            clearAPIKey();
+            toast('API key revoked.', 'success');
+        } catch (err) {
+            toast(err.message, 'error');
+        }
+    }
+
     // ---------- create flow -----------------------------------------------
 
     function openCreate() {
@@ -1330,12 +1672,13 @@
         const maxClicksRaw = els.maxClicksInput.value.trim();
         const max_clicks = maxClicksRaw ? parseInt(maxClicksRaw, 10) : undefined;
         const password = els.passwordInput.value;
+        const webhook_url = els.webhookInput.value.trim();
 
         els.createBtn.disabled = true;
         const original = els.createBtn.textContent;
         els.createBtn.textContent = 'Creating…';
         try {
-            const data = await apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password });
+            const data = await apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url });
             saveToken(data.short_code, data.admin_token);
             const seed = {
                 short_code: data.short_code,
@@ -1347,7 +1690,15 @@
                 tags: data.tags || [],
                 max_clicks: data.max_clicks || 0,
                 has_password: !!data.has_password,
+                webhook_url: data.webhook_url || '',
             };
+            // The webhook secret is returned ONCE — surface it in a toast
+            // with a copy button so the user can stash it. (We can't
+            // persist it; the server has only the raw bytes for HMAC and
+            // doesn't echo them again.)
+            if (data.webhook_secret) {
+                showWebhookSecret(data.short_code, data.webhook_secret);
+            }
             rows.set(data.short_code, { code: data.short_code, token: data.admin_token, status: 'active', data: seed });
             // Seed the snapshot so the FIRST real click after creation is
             // flagged as activity (otherwise prev would be undefined and the
@@ -1674,6 +2025,19 @@
         els.cancelCreateBtn.addEventListener('click', closeCreate);
         els.createForm.addEventListener('submit', submitCreate);
 
+        els.keyBtn.addEventListener('click', openKeyPanel);
+        els.keyCancelBtn.addEventListener('click', closeKeyPanel);
+        els.keyCreateForm.addEventListener('submit', submitCreateKey);
+        els.keyPasteBtn.addEventListener('click', pasteAPIKey);
+        els.keyClearBtn.addEventListener('click', clearAPIKey);
+        els.keyRevokeBtn.addEventListener('click', revokeAPIKey);
+        els.keyCopyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(apiKey);
+                toast('API key copied.', 'success');
+            } catch (_) { toast('Copy failed.', 'error'); }
+        });
+
         els.importBtn.addEventListener('click', openImport);
         els.emptyImportBtn.addEventListener('click', openImport);
         els.cancelImportBtn.addEventListener('click', closeImport);
@@ -1707,11 +2071,13 @@
         }, REFRESH_MS);
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('DOMContentLoaded', async () => {
         initTheme();
         bind();
-        // Initial load
-        if (tokensFromStorage().length === 0) {
+        // Init the API key before the first list call so /api/urls is
+        // used right away if the key is valid.
+        await initAPIKey();
+        if (tokensFromStorage().length === 0 && !apiKey) {
             els.loadingState.classList.add('hidden');
             els.emptyState.classList.remove('hidden');
         }

@@ -18,6 +18,7 @@
                 <select id="tagFilter" class="btn" aria-label="Filter by tag" title="Filter by tag">
                     <option value="">All tags</option>
                 </select>
+                <button id="keyBtn" class="btn" title="Manage API key">🔑</button>
                 <button id="importBtn" class="btn">Import</button>
                 <button id="newBtn" class="btn btn-primary">+ New URL</button>
                 <button id="themeToggle" class="btn btn-icon" aria-label="Toggle theme" title="Toggle theme">
@@ -55,10 +56,47 @@
                             <span class="field-label">Password (optional)</span>
                             <input type="password" id="passwordInput" placeholder="passphrase" autocomplete="new-password">
                         </label>
+                        <label class="field" style="grid-column: span 2;">
+                            <span class="field-label">Webhook URL (optional)</span>
+                            <input type="url" id="webhookInput" placeholder="https://hooks.example.com/clicks">
+                        </label>
                     </div>
                     <div class="form-actions">
                         <button type="button" id="cancelCreateBtn" class="btn btn-ghost">Cancel</button>
                         <button type="submit" id="createBtn" class="btn btn-primary">Create</button>
+                    </div>
+                </form>
+            </section>
+
+            <section id="keyPanel" class="create-panel hidden" aria-labelledby="keyPanelTitle">
+                <h2 id="keyPanelTitle">API key</h2>
+                <p class="muted" style="margin-bottom: 0.5rem;">An API key lets you list and manage URLs across devices without per-URL admin tokens. Keys are saved in this browser only.</p>
+                <div id="keyActiveBlock" class="hidden" style="margin-bottom: 0.75rem;">
+                    <p class="muted" style="margin-bottom: 0.4rem;">Active key (label: <span id="keyLabel">—</span>)</p>
+                    <div class="token-row">
+                        <code id="keyValue" style="word-break: break-all;"></code>
+                        <button id="keyCopyBtn" class="btn btn-ghost btn-sm">Copy</button>
+                    </div>
+                    <div class="form-actions" style="margin-top: 0.5rem;">
+                        <button id="keyRevokeBtn" type="button" class="btn btn-danger btn-sm">Revoke key</button>
+                        <button id="keyClearBtn" type="button" class="btn btn-ghost btn-sm">Forget on this device</button>
+                    </div>
+                </div>
+                <form id="keyCreateForm" novalidate>
+                    <div class="form-grid">
+                        <label class="field" style="grid-column: span 2;">
+                            <span class="field-label">New key label (optional)</span>
+                            <input type="text" id="keyLabelInput" placeholder="my-laptop" maxlength="64">
+                        </label>
+                        <label class="field" style="grid-column: span 2;">
+                            <span class="field-label">…or paste an existing key</span>
+                            <input type="text" id="keyPasteInput" placeholder="base64-encoded token" autocomplete="off" spellcheck="false">
+                        </label>
+                    </div>
+                    <div class="form-actions">
+                        <button type="button" id="keyCancelBtn" class="btn btn-ghost">Close</button>
+                        <button type="button" id="keyPasteBtn" class="btn">Use pasted key</button>
+                        <button type="submit" id="keyCreateBtn" class="btn btn-primary">Create new key</button>
                     </div>
                 </form>
             </section>

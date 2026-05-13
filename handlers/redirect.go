@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"sync/atomic"
@@ -28,6 +30,16 @@ type RedirectConfig struct {
 	// DNSCache, if set, memoises the runtime SSRF re-check across hot
 	// URLs. Nil falls through to direct resolution on every redirect.
 	DNSCache *services.DNSCache
+	// Webhook, if set, receives an Enqueue call for every successful
+	// click whose mapping has a WebhookURL configured. Delivery is
+	// asynchronous and best-effort; failed deliveries are logged but do
+	// not affect the redirect itself.
+	Webhook *services.WebhookDispatcher
+	// GeoIP, if set, populates ClickEvent.Country from the client IP.
+	// The instance returned by services.NewGeoIP is always safe to use
+	// (no-ops when the embedded DB is the placeholder), so wiring it in
+	// unconditionally is fine.
+	GeoIP *services.GeoIP
 }
 
 // RedirectHandler handles URL redirect requests.
@@ -128,17 +140,32 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Referer: services.TruncateReferer(r.Header.Get("Referer")),
 		UAClass: services.ClassifyUserAgent(r.Header.Get("User-Agent")),
 	}
+	// Resolve the client IP once for both IP-hash and geo-lookup so we
+	// don't pay the parse cost twice. middleware.ClientIP honours the
+	// trust-proxy setting; we just feed its raw string to net.ParseIP.
+	clientIP := middleware.ClientIP(r, h.cfg.TrustProxy)
 	if h.cfg.LogIP {
-		ev.IPHash = services.HashIP(middleware.ClientIP(r, h.cfg.TrustProxy))
+		ev.IPHash = services.HashIP(clientIP)
+	}
+	if h.cfg.GeoIP != nil && clientIP != "" {
+		if parsed := net.ParseIP(clientIP); parsed != nil {
+			ev.Country = h.cfg.GeoIP.Country(parsed)
+		}
 	}
 	if err := h.storage.RecordClick(shortCode, ev); err != nil {
 		slog.WarnContext(r.Context(), "recordClick failed", "code", shortCode, "err", err)
-	} else if h.cfg.Stream != nil {
-		// Only publish AFTER RecordClick succeeded — otherwise an SSE
-		// subscriber would see events that aren't reflected in the
-		// canonical click_events table. Best-effort: Publish drops on a
-		// full subscriber buffer rather than blocking the redirect.
-		h.cfg.Stream.Publish(shortCode, ev)
+	} else {
+		// Only fan out AFTER RecordClick succeeded — both SSE subscribers
+		// and webhook receivers should never see events that aren't
+		// reflected in the canonical click_events table.
+		if h.cfg.Stream != nil {
+			// Best-effort: Publish drops on a full subscriber buffer
+			// rather than blocking the redirect.
+			h.cfg.Stream.Publish(shortCode, ev)
+		}
+		if h.cfg.Webhook != nil && urlMapping.WebhookURL != "" {
+			h.enqueueWebhook(shortCode, urlMapping, ev)
+		}
 	}
 
 	http.Redirect(w, r, urlMapping.OriginalURL, http.StatusFound)
@@ -238,4 +265,43 @@ func renderPasswordForm(w http.ResponseWriter, status int, code, errMsg string) 
 		Code     string
 		ErrorMsg string
 	}{Code: code, ErrorMsg: errMsg})
+}
+
+// webhookPayload is the JSON body posted to the owner-configured webhook
+// target. It mirrors a single click_events row plus the short code so
+// downstream consumers can correlate without a separate API call.
+type webhookPayload struct {
+	ShortCode string    `json:"short_code"`
+	At        time.Time `json:"at"`
+	IPHash    string    `json:"ip_hash,omitempty"`
+	Referer   string    `json:"referer,omitempty"`
+	UAClass   string    `json:"ua_class,omitempty"`
+	Country   string    `json:"country,omitempty"`
+}
+
+// enqueueWebhook builds the JSON payload and submits it to the dispatcher.
+// Marshalling happens on the request goroutine but the actual HTTP POST
+// runs on a worker; the request handler returns 302 immediately and the
+// delivery completes (or fails, with logging) in the background.
+func (h *RedirectHandler) enqueueWebhook(code string, m *models.URLMapping, ev models.ClickEvent) {
+	payload, err := json.Marshal(webhookPayload{
+		ShortCode: code,
+		At:        ev.At,
+		IPHash:    ev.IPHash,
+		Referer:   ev.Referer,
+		UAClass:   ev.UAClass,
+		Country:   ev.Country,
+	})
+	if err != nil {
+		// Marshalling a struct with only string/time fields shouldn't
+		// fail, but if it ever does there is nothing useful to do here.
+		slog.Warn("webhook: marshal failed", "code", code, "err", err)
+		return
+	}
+	h.cfg.Webhook.Enqueue(services.WebhookEvent{
+		Code:    code,
+		URL:     m.WebhookURL,
+		Secret:  m.WebhookSecret,
+		Payload: payload,
+	})
 }

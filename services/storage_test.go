@@ -248,6 +248,91 @@ func runStoreContractTests(t *testing.T, newStore func(t *testing.T) Store) {
 			t.Errorf("ClicksByBucket(missing) = %v, want ErrNotFound", err)
 		}
 	})
+
+	t.Run("api key create + lookup + delete", func(t *testing.T) {
+		s := newStore(t)
+		hash := []byte("hash-32-bytes-padding-to-thirty2!")[:32]
+		k, err := s.CreateAPIKey("laptop", hash)
+		if err != nil {
+			t.Fatalf("CreateAPIKey: %v", err)
+		}
+		if k.ID == 0 {
+			t.Errorf("CreateAPIKey returned ID=0")
+		}
+		got, err := s.LookupAPIKey(hash)
+		if err != nil {
+			t.Fatalf("LookupAPIKey: %v", err)
+		}
+		if got.ID != k.ID {
+			t.Errorf("LookupAPIKey ID = %d, want %d", got.ID, k.ID)
+		}
+		if got.LastUsedAt == nil {
+			t.Errorf("LookupAPIKey did not stamp LastUsedAt")
+		}
+		// Bind a URL and confirm DeleteAPIKey clears its api_key_id.
+		_ = s.Set("u1", &models.URLMapping{
+			ID: "u1", OriginalURL: "https://example.com", CreatedAt: time.Now(),
+			APIKeyID: k.ID,
+		})
+		if err := s.DeleteAPIKey(k.ID); err != nil {
+			t.Fatalf("DeleteAPIKey: %v", err)
+		}
+		if _, err := s.LookupAPIKey(hash); !errors.Is(err, ErrNotFound) {
+			t.Errorf("LookupAPIKey after delete = %v, want ErrNotFound", err)
+		}
+		m, err := s.Get("u1")
+		if err != nil {
+			t.Fatalf("Get after key delete: %v", err)
+		}
+		if m.APIKeyID != 0 {
+			t.Errorf("URL.APIKeyID = %d after key delete, want 0", m.APIKeyID)
+		}
+	})
+
+	t.Run("list urls by api key returns only owned", func(t *testing.T) {
+		s := newStore(t)
+		k1, _ := s.CreateAPIKey("k1", []byte("a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a1"))
+		k2, _ := s.CreateAPIKey("k2", []byte("b-b-b-b-b-b-b-b-b-b-b-b-b-b-b-b2"))
+		_ = s.Set("by-k1", &models.URLMapping{
+			ID: "by-k1", OriginalURL: "https://x", CreatedAt: time.Now(),
+			APIKeyID: k1.ID,
+		})
+		_ = s.Set("by-k2", &models.URLMapping{
+			ID: "by-k2", OriginalURL: "https://y", CreatedAt: time.Now(),
+			APIKeyID: k2.ID,
+		})
+		_ = s.Set("orphan", &models.URLMapping{
+			ID: "orphan", OriginalURL: "https://z", CreatedAt: time.Now(),
+		})
+		got, err := s.ListURLsByAPIKey(k1.ID, 10, 0)
+		if err != nil {
+			t.Fatalf("ListURLsByAPIKey: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "by-k1" {
+			t.Errorf("ListURLsByAPIKey(k1) = %+v, want exactly [by-k1]", got)
+		}
+	})
+
+	t.Run("click event preserves country", func(t *testing.T) {
+		s := newStore(t)
+		_ = s.Set("co", &models.URLMapping{
+			ID: "co", OriginalURL: "https://example.com", CreatedAt: time.Now(),
+		})
+		if err := s.RecordClick("co", models.ClickEvent{
+			At:      time.Now(),
+			UAClass: "desktop",
+			Country: "DE",
+		}); err != nil {
+			t.Fatalf("RecordClick: %v", err)
+		}
+		got, err := s.RecentClicks("co", 1)
+		if err != nil {
+			t.Fatalf("RecentClicks: %v", err)
+		}
+		if len(got) != 1 || got[0].Country != "DE" {
+			t.Errorf("Country = %q, want DE (events=%+v)", got[0].Country, got)
+		}
+	})
 }
 
 func TestMemoryStoreContract(t *testing.T) {

@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS click_events (
 );
 CREATE INDEX IF NOT EXISTS idx_click_events_code_time
     ON click_events(short_code, clicked_at DESC);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash   BLOB NOT NULL UNIQUE,
+    label        TEXT,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER
+);
 `
 
 // addedColumns is the list of columns that didn't exist in the v1 schema
@@ -66,10 +74,14 @@ CREATE INDEX IF NOT EXISTS idx_click_events_code_time
 // Each entry is run as a standalone ALTER TABLE; SQLite forbids multiple
 // ADD COLUMNs in one statement.
 var addedColumns = []string{
-	`ALTER TABLE urls ADD COLUMN tags TEXT`,          // JSON array; NULL == no tags
-	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`, // 0/NULL == unlimited
-	`ALTER TABLE urls ADD COLUMN password_hash BLOB`, // NULL == no password
-	`ALTER TABLE urls ADD COLUMN password_salt BLOB`, // paired with password_hash
+	`ALTER TABLE urls ADD COLUMN tags TEXT`,            // JSON array; NULL == no tags
+	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,   // 0/NULL == unlimited
+	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,   // NULL == no password
+	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,   // paired with password_hash
+	`ALTER TABLE urls ADD COLUMN webhook_url TEXT`,     // NULL == no webhook
+	`ALTER TABLE urls ADD COLUMN webhook_secret BLOB`,  // HMAC-SHA256 key; paired with webhook_url
+	`ALTER TABLE click_events ADD COLUMN country TEXT`, // ISO-3166-1 alpha-2; NULL when geoip is off
+	`ALTER TABLE urls ADD COLUMN api_key_id INTEGER`,   // NULL when not bound to an API key
 }
 
 // NewSQLiteStore opens (or creates) a SQLite database at path and applies
@@ -147,10 +159,11 @@ func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	// passed (the TOCTOU race window between Exists and Set). This is the
 	// non-upsert contract described on MemoryStore.Set.
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt)
-		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id)
+		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
 		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
+		nullableText(m.WebhookURL), nullableBlob(m.WebhookSecret), nullableInt(m.APIKeyID),
 	)
 	if err != nil {
 		return err
@@ -209,13 +222,16 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		maxClicks      sql.NullInt64
 		passwordHash   []byte
 		passwordSalt   []byte
+		webhookURL     sql.NullString
+		webhookSecret  []byte
+		apiKeyID       sql.NullInt64
 	)
 	err := s.db.QueryRow(
 		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
-		        tags, max_clicks, password_hash, password_salt
+		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id
 		 FROM urls WHERE short_code = ?`, code,
 	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
-		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt)
+		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -231,6 +247,9 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		OwnerTokenHash: ownerTokenHash,
 		PasswordHash:   passwordHash,
 		PasswordSalt:   passwordSalt,
+		WebhookURL:     webhookURL.String,
+		WebhookSecret:  webhookSecret,
+		APIKeyID:       apiKeyID.Int64,
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -322,9 +341,9 @@ func (s *SQLiteStore) RecordClick(code string, ev models.ClickEvent) error {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class)
-		 VALUES (?, ?, ?, ?, ?)`,
-		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass),
+		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class, country)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass), nullableText(ev.Country),
 	); err != nil {
 		return err
 	}
@@ -341,7 +360,7 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 		limit = 50
 	}
 	rows, err := s.db.Query(
-		`SELECT clicked_at, ip_hash, referer, ua_class
+		`SELECT clicked_at, ip_hash, referer, ua_class, country
 		 FROM click_events WHERE short_code = ?
 		 ORDER BY clicked_at DESC LIMIT ?`,
 		code, limit,
@@ -353,10 +372,10 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 	out := make([]models.ClickEvent, 0)
 	for rows.Next() {
 		var (
-			ts                       int64
-			ipHash, referer, uaClass sql.NullString
+			ts                                int64
+			ipHash, referer, uaClass, country sql.NullString
 		)
-		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass); err != nil {
+		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass, &country); err != nil {
 			return nil, err
 		}
 		out = append(out, models.ClickEvent{
@@ -364,6 +383,7 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 			IPHash:  ipHash.String,
 			Referer: referer.String,
 			UAClass: uaClass.String,
+			Country: country.String,
 		})
 	}
 	return out, rows.Err()
@@ -430,6 +450,18 @@ func (s *SQLiteStore) Update(code string, f UpdateFields) error {
 	case f.PasswordHash != nil:
 		sets = append(sets, "password_hash = ?", "password_salt = ?")
 		args = append(args, nullableBlob(f.PasswordHash), nullableBlob(f.PasswordSalt))
+	}
+	switch {
+	case f.ClearWebhook:
+		sets = append(sets, "webhook_url = ?", "webhook_secret = ?")
+		args = append(args, nil, nil)
+	case f.WebhookURL != nil:
+		sets = append(sets, "webhook_url = ?", "webhook_secret = ?")
+		args = append(args, nullableText(*f.WebhookURL), nullableBlob(f.WebhookSecret))
+	}
+	if f.APIKeyID != nil {
+		sets = append(sets, "api_key_id = ?")
+		args = append(args, nullableInt(*f.APIKeyID))
 	}
 
 	if len(sets) == 0 {

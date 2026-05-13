@@ -52,7 +52,7 @@ func (h *StreamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !authorizeOwner(r, mapping.OwnerTokenHash) {
+	if !authorizeAccess(r, mapping, h.storage) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 		return
 	}

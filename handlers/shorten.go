@@ -40,6 +40,21 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If the caller authenticates with an API key, the resulting URL is
+	// bound to that key (api_key_id). Unauthenticated callers continue
+	// to use the per-URL admin token model — both paths return an
+	// admin_token, so existing clients don't break.
+	var apiKeyID int64
+	if _, hash := extractBearer(r); hash != nil {
+		if key, err := h.storage.LookupAPIKey(hash); err == nil {
+			apiKeyID = key.ID
+		}
+		// A bearer that doesn't match any API key is NOT an error — we
+		// fall through to the unauthenticated flow. This matters for the
+		// dashboard, which may have a stale key in localStorage; the
+		// shorten still works, the URL just isn't auto-claimed.
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 
 	var req models.ShortenRequest
@@ -109,6 +124,22 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var webhookSecret []byte
+	if req.WebhookURL != "" {
+		// Same SSRF + deny rules as the destination URL. A webhook target
+		// pointing at 127.0.0.1 would let an attacker pivot through our
+		// click-driven HTTP client to internal services.
+		if err := services.ValidateDestinationURL(req.WebhookURL, h.denyList); err != nil {
+			writeError(w, http.StatusBadRequest, "webhook_url: "+validationMessage(err))
+			return
+		}
+		webhookSecret, err = generateWebhookSecret()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to generate webhook secret")
+			return
+		}
+	}
+
 	if shortCode == "" {
 		c, err := services.GenerateShortCode(h.storage)
 		if err != nil {
@@ -141,6 +172,9 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		MaxClicks:      req.MaxClicks,
 		PasswordHash:   pwHash,
 		PasswordSalt:   pwSalt,
+		WebhookURL:     req.WebhookURL,
+		WebhookSecret:  webhookSecret,
+		APIKeyID:       apiKeyID,
 	}
 	if err := h.storage.Set(shortCode, urlMapping); err != nil {
 		// Defense-in-depth for the Exists/Set TOCTOU race: another writer
@@ -164,6 +198,12 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Tags:        tags,
 		MaxClicks:   req.MaxClicks,
 		HasPassword: len(pwHash) > 0,
+		WebhookURL:  req.WebhookURL,
+	}
+	if len(webhookSecret) > 0 {
+		// Returned ONCE — same contract as admin_token. Owner is
+		// expected to save it; rotation re-issues with a new value.
+		response.WebhookSecret = encodeWebhookSecret(webhookSecret)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -183,6 +223,28 @@ func generateOwnerToken() (string, []byte, error) {
 	token := base64.RawURLEncoding.EncodeToString(b)
 	h := sha256.Sum256([]byte(token))
 	return token, h[:], nil
+}
+
+// generateWebhookSecret returns 32 cryptographically random bytes for use
+// as an HMAC-SHA256 key. Unlike the admin token (where we store only the
+// hash), the raw secret IS persisted — webhook signature verification on
+// the receiver side requires the original key, so we can't one-way it.
+// Stored as a BLOB column with the same row-level access controls as the
+// destination URL.
+func generateWebhookSecret() ([]byte, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// encodeWebhookSecret serialises the raw secret into the form returned to
+// the API client. base64url with no padding matches the admin_token
+// encoding and is URL-safe so receivers can embed it in env files
+// without escaping.
+func encodeWebhookSecret(secret []byte) string {
+	return base64.RawURLEncoding.EncodeToString(secret)
 }
 
 func customCodeMessage(err error) string {

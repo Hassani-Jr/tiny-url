@@ -49,6 +49,8 @@ tags:
     description: Create, redirect, modify, delete short URLs.
   - name: Analytics
     description: Owner-only metrics and click event log.
+  - name: Keys
+    description: Account-level API keys that own multiple short URLs.
   - name: Operations
     description: Liveness, readiness, metrics.
 
@@ -349,6 +351,133 @@ paths:
         '410': { description: URL has expired }
         '429': { $ref: '#/components/responses/RateLimited' }
 
+  /api/keys:
+    post:
+      tags: [Keys]
+      summary: Mint a new API key
+      description: |
+        Anyone can create an API key. The returned `token` is shown
+        ONCE; the server stores only its SHA-256 hash. Subsequent
+        requests authenticate via `Authorization: Bearer <token>` —
+        the same header used for per-URL admin tokens.
+
+        Use cases: claim ownership of URLs you create with
+        `POST /api/shorten` (the server binds the new URL to the
+        authenticated key), and list/manage them across devices via
+        `GET /api/urls`. Existing per-URL admin tokens keep working
+        unchanged.
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  maxLength: 64
+                  description: Optional owner-supplied label.
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, token, created_at]
+                properties:
+                  id:         { type: integer, format: int64 }
+                  label:      { type: string }
+                  created_at: { type: string, format: date-time }
+                  token:      { type: string, description: 'Shown once. Save it deliberately.' }
+        '400': { description: Body too large or malformed }
+        '403': { description: Missing X-Requested-With header }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [Keys]
+      summary: Get the calling key's metadata
+      security:
+        - BearerToken: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:           { type: integer, format: int64 }
+                  label:        { type: string }
+                  created_at:   { type: string, format: date-time }
+                  last_used_at: { type: string, format: date-time, nullable: true }
+        '401': { description: Missing or invalid API key }
+    patch:
+      tags: [Keys]
+      summary: Update the calling key's label
+      security:
+        - BearerToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label: { type: string, maxLength: 64 }
+      responses:
+        '200':
+          description: Updated
+        '400': { description: Invalid body }
+        '401': { description: Missing or invalid API key }
+    delete:
+      tags: [Keys]
+      summary: Revoke the calling key
+      description: |
+        Revokes the key used to authenticate this request. URLs that
+        were bound to the key SURVIVE — their `api_key_id` column is
+        cleared, and the per-URL admin token remains a valid
+        credential. To delete those URLs as well, call `DELETE
+        /api/url/{code}` for each before revoking the key.
+      security:
+        - BearerToken: []
+      responses:
+        '204': { description: Revoked }
+        '401': { description: Missing or invalid API key }
+
+  /api/urls:
+    get:
+      tags: [Keys]
+      summary: List URLs owned by the calling key
+      description: |
+        Paginated, newest-first. Each entry has the same shape as
+        `AnalyticsResponse` so the dashboard can render the table
+        without per-row analytics fetches.
+      security:
+        - BearerToken: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  urls:
+                    type: array
+                    items: { $ref: '#/components/schemas/AnalyticsResponse' }
+        '401': { description: Missing or invalid API key }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   /api/url/{code}/rotate:
     parameters:
       - $ref: '#/components/parameters/Code'
@@ -582,10 +711,21 @@ components:
     BearerToken:
       type: http
       scheme: bearer
-      bearerFormat: '32-byte URL-safe-base64 admin token'
+      bearerFormat: '32-byte URL-safe-base64 token'
       description: |
-        Per-URL admin token returned at creation. Compared in constant
-        time against the stored SHA-256 hash.
+        Bearer token. Accepts EITHER:
+
+        - Per-URL admin token returned at create time (covers analytics,
+          PATCH, DELETE, rotate, clicks, series, and stream for that
+          specific URL), OR
+        - Account-level API key from `POST /api/keys` (covers every URL
+          bound to that key via `api_key_id`, plus the /api/keys and
+          /api/urls endpoints).
+
+        Both are compared in constant time against the stored SHA-256
+        hash. A bearer that matches the URL's admin token is preferred —
+        the API key lookup only runs when the admin-token check fails
+        AND the URL has a non-zero `api_key_id`.
 
   schemas:
 
@@ -622,6 +762,17 @@ components:
           type: string
           maxLength: 256
           description: Optional passphrase. When set, the short URL serves an interstitial HTML form before redirecting. Stored as PBKDF2-SHA256 hash + salt.
+        webhook_url:
+          type: string
+          format: uri
+          description: |
+            Optional HTTPS endpoint POST'd on each successful click. Same
+            SSRF / deny-list rules as the destination URL. A 32-byte
+            random HMAC-SHA256 key is generated server-side and returned
+            ONCE in `webhook_secret` — receivers verify the
+            `X-Tinyurl-Signature: sha256=<hex>` header against the raw
+            request body. 5xx responses are retried (3 attempts, 200/800
+            ms backoff); 4xx is treated as terminal misconfiguration.
 
     ShortenResponse:
       type: object
@@ -655,6 +806,13 @@ components:
           type: integer
         has_password:
           type: boolean
+        webhook_url:
+          type: string
+          format: uri
+          description: Empty when no webhook is configured.
+        webhook_secret:
+          type: string
+          description: Returned ONCE when a webhook is configured at create time. base64url-encoded 32 random bytes; HMAC-SHA256 key.
 
     AnalyticsResponse:
       type: object
@@ -668,6 +826,7 @@ components:
         tags:          { type: array, items: { type: string } }
         max_clicks:    { type: integer }
         has_password:  { type: boolean }
+        webhook_url:   { type: string, format: uri }
 
     ClicksResponse:
       type: object
@@ -699,6 +858,12 @@ components:
             Coarse User-Agent bucket. The raw UA is intentionally not
             stored — it would be a fingerprinting vector and a targeting
             hint for exploit kits.
+        country:
+          type: string
+          description: |
+            ISO-3166-1 alpha-2 country code resolved from the client IP
+            via the embedded MaxMind GeoLite2 database. Empty when
+            geoip is disabled, the IP is private, or no match exists.
 
     PatchRequest:
       type: object
@@ -725,6 +890,12 @@ components:
           type: string
           maxLength: 256
           description: '`""` clears the password; non-empty sets/replaces it; omitted → unchanged.'
+        webhook_url:
+          type: string
+          description: '`""` clears the webhook; non-empty sets/replaces it; omitted → unchanged. Newly set or rotated webhooks return a fresh `webhook_secret` in the response.'
+        webhook_rotate_secret:
+          type: boolean
+          description: When `true`, issues a fresh webhook secret (returned once) without changing the URL. Requires an existing webhook.
 
     PatchResponse:
       type: object

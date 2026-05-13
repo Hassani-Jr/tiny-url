@@ -52,6 +52,13 @@ type patchRequest struct {
 	Tags           *[]string `json:"tags"`
 	MaxClicks      *int64    `json:"max_clicks"`
 	Password       *string   `json:"password"`
+	// WebhookURL=nil  → leave alone
+	// WebhookURL=""   → clear webhook + secret
+	// WebhookURL=URL  → set new URL; if `webhook_rotate_secret` is true OR
+	//                   the URL is being newly added (was empty before), a
+	//                   fresh secret is generated and returned.
+	WebhookURL    *string `json:"webhook_url"`
+	RotateWebhook bool    `json:"webhook_rotate_secret"`
 }
 
 func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,8 +77,8 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if req.URL == nil && req.ExpirationMins == nil && req.Tags == nil && req.MaxClicks == nil && req.Password == nil {
-		writeError(w, http.StatusBadRequest, "Provide at least one of url, expiration_mins, tags, max_clicks, password")
+	if req.URL == nil && req.ExpirationMins == nil && req.Tags == nil && req.MaxClicks == nil && req.Password == nil && req.WebhookURL == nil && !req.RotateWebhook {
+		writeError(w, http.StatusBadRequest, "Provide at least one of url, expiration_mins, tags, max_clicks, password, webhook_url")
 		return
 	}
 
@@ -89,7 +96,7 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !authorizeOwner(r, mapping.OwnerTokenHash) {
+	if !authorizeAccess(r, mapping, h.storage) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid admin token")
 		return
 	}
@@ -180,6 +187,55 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// New secret returned in the response. Only populated when one was
+	// actually generated (new webhook or explicit rotate), so the response
+	// stays empty on every other PATCH.
+	var newWebhookSecret []byte
+	if req.WebhookURL != nil {
+		switch {
+		case *req.WebhookURL == "":
+			patchFields.ClearWebhook = true
+		default:
+			if err := services.ValidateDestinationURL(*req.WebhookURL, h.denyList); err != nil {
+				writeError(w, http.StatusBadRequest, "webhook_url: "+validationMessage(err))
+				return
+			}
+			patchFields.WebhookURL = req.WebhookURL
+			// Generate a new secret when the webhook is being newly added
+			// (previous mapping had none) OR when the caller explicitly
+			// asked to rotate it. Otherwise leave the existing secret in
+			// place — same URL, same key.
+			if len(mapping.WebhookSecret) == 0 || req.RotateWebhook {
+				secret, gerr := generateWebhookSecret()
+				if gerr != nil {
+					http.Error(w, "Internal server error", http.StatusInternalServerError)
+					return
+				}
+				patchFields.WebhookSecret = secret
+				newWebhookSecret = secret
+			} else {
+				// Preserve existing secret: pass it back into the store
+				// so the URL update doesn't accidentally null it out.
+				patchFields.WebhookSecret = mapping.WebhookSecret
+			}
+		}
+	} else if req.RotateWebhook {
+		// Rotate without changing the URL. Requires an existing webhook.
+		if mapping.WebhookURL == "" {
+			writeError(w, http.StatusBadRequest, "webhook_rotate_secret requires an existing webhook_url")
+			return
+		}
+		secret, gerr := generateWebhookSecret()
+		if gerr != nil {
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+		existingURL := mapping.WebhookURL
+		patchFields.WebhookURL = &existingURL
+		patchFields.WebhookSecret = secret
+		newWebhookSecret = secret
+	}
+
 	if err := h.storage.Update(code, patchFields); err != nil {
 		if errors.Is(err, services.ErrNotFound) {
 			http.NotFound(w, r)
@@ -196,14 +252,23 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"short_code":   updated.ID,
 		"original_url": updated.OriginalURL,
 		"expires_at":   updated.ExpiresAt,
 		"tags":         updated.Tags,
 		"max_clicks":   updated.MaxClicks,
 		"has_password": len(updated.PasswordHash) > 0,
-	})
+		"webhook_url":  updated.WebhookURL,
+	}
+	// Only attach the secret when one was generated on this PATCH — this
+	// is the only time the plaintext key leaves the server, mirroring
+	// the admin_token contract.
+	if len(newWebhookSecret) > 0 {
+		resp["webhook_secret"] = encodeWebhookSecret(newWebhookSecret)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
