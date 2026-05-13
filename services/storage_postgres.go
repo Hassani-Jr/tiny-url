@@ -73,6 +73,20 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at   BIGINT NOT NULL,
     last_used_at BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id          BIGSERIAL PRIMARY KEY,
+    at          BIGINT NOT NULL,
+    actor_kind  TEXT NOT NULL,
+    actor_id    TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id   TEXT NOT NULL DEFAULT '',
+    metadata    TEXT,
+    request_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_events(at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor_kind, actor_id);
 `
 
 // postgresMigrations adds columns introduced after the initial schema

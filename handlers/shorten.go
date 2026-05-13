@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 	"tiny-url/models"
@@ -205,6 +206,23 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// expected to save it; rotation re-issues with a new value.
 		response.WebhookSecret = encodeWebhookSecret(webhookSecret)
 	}
+
+	// Audit: which credential created this URL? Anon when no bearer
+	// was present; the API key otherwise. There's no admin-token case
+	// at create time since the admin token doesn't exist until we
+	// generate it above.
+	actorKind, actorID := models.AuditActorAnon, ""
+	if apiKeyID > 0 {
+		actorKind, actorID = models.AuditActorAPIKey, fmt.Sprintf("%d", apiKeyID)
+	}
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  actorKind,
+		ActorID:    actorID,
+		Action:     models.AuditActionURLCreate,
+		TargetKind: "url",
+		TargetID:   shortCode,
+		RequestID:  requestIDFromContext(r),
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)

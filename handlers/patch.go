@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"tiny-url/models"
 	"tiny-url/services"
 )
 
@@ -252,6 +253,45 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+	// Audit: list the fields that were actually present in the PATCH
+	// body so an operator reading the log can see "url changed but
+	// expiration didn't" without diffing rows. We send only the
+	// list of field NAMES — actual values would leak the new
+	// password / webhook secret if those were included.
+	changed := []string{}
+	if req.URL != nil {
+		changed = append(changed, "url")
+	}
+	if req.ExpirationMins != nil {
+		changed = append(changed, "expiration_mins")
+	}
+	if req.Tags != nil {
+		changed = append(changed, "tags")
+	}
+	if req.MaxClicks != nil {
+		changed = append(changed, "max_clicks")
+	}
+	if req.Password != nil {
+		changed = append(changed, "password")
+	}
+	if req.WebhookURL != nil {
+		changed = append(changed, "webhook_url")
+	}
+	if req.RotateWebhook {
+		changed = append(changed, "webhook_rotate_secret")
+	}
+	metaBytes, _ := json.Marshal(map[string]any{"fields": changed})
+	actorKind, actorID := resolveActor(r, mapping, h.storage)
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  actorKind,
+		ActorID:    actorID,
+		Action:     models.AuditActionURLPatch,
+		TargetKind: "url",
+		TargetID:   code,
+		Metadata:   string(metaBytes),
+		RequestID:  requestIDFromContext(r),
+	})
+
 	resp := map[string]any{
 		"short_code":   updated.ID,
 		"original_url": updated.OriginalURL,

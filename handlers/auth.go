@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
+	"tiny-url/middleware"
 	"tiny-url/models"
 	"tiny-url/services"
 )
@@ -83,4 +86,52 @@ func authorizeAccess(r *http.Request, mapping *models.URLMapping, store services
 		return false
 	}
 	return key.ID == mapping.APIKeyID
+}
+
+// resolveActor inspects the request to figure out which credential
+// authenticated it. Used by the audit-log call sites so each event
+// records the right actor kind + id even though the per-URL handlers
+// accept either credential via authorizeAccess.
+//
+// Returns:
+//
+//	("apikey", "<id>")           when the bearer is an API key
+//	("admin_token", "<code>")    when the bearer is the URL's own admin token
+//	("anon", "")                 when no recognized credential is present
+//
+// The mapping argument is optional — pass nil for endpoints that
+// don't operate on a specific URL (e.g. POST /api/keys). When nil
+// the function can only return "apikey" or "anon" since there's no
+// admin-token hash to compare against.
+func resolveActor(r *http.Request, mapping *models.URLMapping, store services.Store) (kind, id string) {
+	_, hash := extractBearer(r)
+	if hash == nil {
+		return models.AuditActorAnon, ""
+	}
+	if mapping != nil && len(mapping.OwnerTokenHash) > 0 &&
+		subtle.ConstantTimeCompare(hash, mapping.OwnerTokenHash) == 1 {
+		return models.AuditActorAdminToken, mapping.ID
+	}
+	key, err := store.LookupAPIKey(hash)
+	if err != nil || key == nil {
+		return models.AuditActorAnon, ""
+	}
+	return models.AuditActorAPIKey, fmt.Sprintf("%d", key.ID)
+}
+
+// logAuditBestEffort fires an audit-log write and swallows the error
+// after logging it. Used by every mutating handler — the user-visible
+// op has already succeeded by the time we call this, so an audit write
+// failure should never roll the operation back.
+func logAuditBestEffort(store services.Store, ev models.AuditEvent) {
+	if err := store.LogAudit(ev); err != nil {
+		slog.Warn("audit log write failed",
+			"action", ev.Action, "target", ev.TargetID, "err", err)
+	}
+}
+
+// requestIDFromContext is a small wrapper over middleware.RequestIDFrom
+// so audit-log call sites don't each have to spell out the chain.
+func requestIDFromContext(r *http.Request) string {
+	return middleware.RequestIDFrom(r.Context())
 }

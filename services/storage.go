@@ -90,6 +90,15 @@ type Store interface {
 	// ListURLsByAPIKey returns the URLs whose api_key_id == id, newest
 	// first, paginated. Used by GET /api/urls.
 	ListURLsByAPIKey(id int64, limit, offset int) ([]*models.URLMapping, error)
+
+	// LogAudit records a state-changing action. Best-effort at the
+	// caller — the handler logs and proceeds if this returns an error
+	// rather than failing the user-visible operation just because the
+	// audit row didn't land.
+	LogAudit(event models.AuditEvent) error
+	// RecentAuditEvents returns events newest-first, paginated. Used
+	// by the operator-gated GET /api/audit endpoint.
+	RecentAuditEvents(limit, offset int) ([]models.AuditEvent, error)
 }
 
 // UpdateFields is the patch payload passed to Store.Update. Pointer fields
@@ -136,7 +145,19 @@ type MemoryStore struct {
 	// match the SQLite AUTOINCREMENT contract (monotonic, never reused).
 	apiKeys   map[int64]*models.APIKey
 	nextKeyID int64
+
+	// Audit log state. memoryAuditCap caps the in-memory ring so a
+	// long-running install can't OOM the process — older events are
+	// dropped FIFO. SQLite + Postgres use time-based retention via the
+	// cleanup goroutine.
+	audit       []models.AuditEvent
+	nextAuditID int64
 }
+
+// memoryAuditCap bounds the in-memory audit ring. Picked to keep the
+// memory footprint negligible (a few KB at most) while still giving
+// operators a useful recent history before old events roll off.
+const memoryAuditCap = 1000
 
 // NewMemoryStore creates an empty MemoryStore.
 func NewMemoryStore() *MemoryStore {
@@ -401,6 +422,57 @@ func sortByCreatedAtDesc(list []*models.URLMapping) {
 	sort.Slice(list, func(i, j int) bool {
 		return list[i].CreatedAt.After(list[j].CreatedAt)
 	})
+}
+
+// LogAudit records an event in the in-memory ring. The ring is bounded
+// (memoryAuditCap) — older entries roll off FIFO once the cap is hit.
+// Synchronous and best-effort at the caller: handlers log + proceed
+// rather than failing the user-visible op if this returns an error.
+func (s *MemoryStore) LogAudit(ev models.AuditEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextAuditID++
+	ev.ID = s.nextAuditID
+	if ev.At.IsZero() {
+		ev.At = time.Now()
+	}
+	if len(s.audit) >= memoryAuditCap {
+		// Drop oldest by sliding the window. copy+truncate is the
+		// simplest implementation; a true ring would save the copy
+		// but the cap is small enough that it doesn't matter.
+		copy(s.audit, s.audit[1:])
+		s.audit = s.audit[:len(s.audit)-1]
+	}
+	s.audit = append(s.audit, ev)
+	return nil
+}
+
+// RecentAuditEvents returns events newest-first with limit/offset
+// pagination. limit<=0 falls back to 50.
+func (s *MemoryStore) RecentAuditEvents(limit, offset int) ([]models.AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	// Walk newest-first by iterating backwards.
+	total := len(s.audit)
+	if offset >= total {
+		return []models.AuditEvent{}, nil
+	}
+	end := total - offset
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	out := make([]models.AuditEvent, 0, end-start)
+	for i := end - 1; i >= start; i-- {
+		out = append(out, s.audit[i])
+	}
+	return out, nil
 }
 
 // ClicksByBucket walks the in-memory event log and aggregates into

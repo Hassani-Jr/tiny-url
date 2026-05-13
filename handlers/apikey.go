@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync/atomic"
 
@@ -80,6 +81,15 @@ func (h *APIKeyHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to persist key")
 		return
 	}
+	// Audit: anonymous actor (POST /api/keys takes no auth) creating
+	// a new key. Target is the key itself, identified by its ID.
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  models.AuditActorAnon,
+		Action:     models.AuditActionAPIKeyCreate,
+		TargetKind: "api_key",
+		TargetID:   fmt.Sprintf("%d", key.ID),
+		RequestID:  requestIDFromContext(r),
+	})
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusCreated)
@@ -144,6 +154,14 @@ func (h *APIKeyHandler) update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to update")
 		return
 	}
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  models.AuditActorAPIKey,
+		ActorID:    fmt.Sprintf("%d", key.ID),
+		Action:     models.AuditActionAPIKeyLabelUpdated,
+		TargetKind: "api_key",
+		TargetID:   fmt.Sprintf("%d", key.ID),
+		RequestID:  requestIDFromContext(r),
+	})
 	key.Label = *req.Label
 	writeAPIKeyJSON(w, http.StatusOK, key)
 }
@@ -162,6 +180,14 @@ func (h *APIKeyHandler) delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to revoke")
 		return
 	}
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  models.AuditActorAPIKey,
+		ActorID:    fmt.Sprintf("%d", key.ID),
+		Action:     models.AuditActionAPIKeyRevoke,
+		TargetKind: "api_key",
+		TargetID:   fmt.Sprintf("%d", key.ID),
+		RequestID:  requestIDFromContext(r),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

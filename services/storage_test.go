@@ -313,6 +313,62 @@ func runStoreContractTests(t *testing.T, newStore func(t *testing.T) Store) {
 		}
 	})
 
+	t.Run("audit log records and reads back", func(t *testing.T) {
+		s := newStore(t)
+		// Log three events out of order; the read MUST return them
+		// newest-first regardless of insertion order.
+		base := time.Now()
+		for i := 0; i < 3; i++ {
+			err := s.LogAudit(models.AuditEvent{
+				At:         base.Add(time.Duration(i) * time.Second),
+				ActorKind:  models.AuditActorAPIKey,
+				ActorID:    "42",
+				Action:     models.AuditActionURLCreate,
+				TargetKind: "url",
+				TargetID:   "code-" + string(rune('a'+i)),
+				RequestID:  "rid-test",
+			})
+			if err != nil {
+				t.Fatalf("LogAudit %d: %v", i, err)
+			}
+		}
+		got, err := s.RecentAuditEvents(10, 0)
+		if err != nil {
+			t.Fatalf("RecentAuditEvents: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("got %d events, want 3", len(got))
+		}
+		// Newest first: index 0 should be the LAST one inserted.
+		if !got[0].At.After(got[2].At) {
+			t.Errorf("events not ordered newest-first: %+v", got)
+		}
+		if got[0].ActorKind != models.AuditActorAPIKey || got[0].ActorID != "42" {
+			t.Errorf("actor not preserved: %+v", got[0])
+		}
+	})
+
+	t.Run("audit log pagination", func(t *testing.T) {
+		s := newStore(t)
+		for i := 0; i < 5; i++ {
+			_ = s.LogAudit(models.AuditEvent{
+				ActorKind:  models.AuditActorAnon,
+				Action:     models.AuditActionURLCreate,
+				TargetKind: "url",
+				TargetID:   "p" + string(rune('a'+i)),
+			})
+		}
+		page1, _ := s.RecentAuditEvents(2, 0)
+		page2, _ := s.RecentAuditEvents(2, 2)
+		if len(page1) != 2 || len(page2) != 2 {
+			t.Fatalf("page lengths: %d, %d, want 2/2", len(page1), len(page2))
+		}
+		// Pages must not overlap.
+		if page1[0].ID == page2[0].ID || page1[1].ID == page2[1].ID {
+			t.Errorf("pages overlap: %v vs %v", page1, page2)
+		}
+	})
+
 	t.Run("click event preserves country", func(t *testing.T) {
 		s := newStore(t)
 		_ = s.Set("co", &models.URLMapping{

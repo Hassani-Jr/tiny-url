@@ -63,6 +63,20 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          INTEGER NOT NULL,
+    actor_kind  TEXT NOT NULL,
+    actor_id    TEXT NOT NULL DEFAULT '',
+    action      TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id   TEXT NOT NULL DEFAULT '',
+    metadata    TEXT,
+    request_id  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_events(at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor_kind, actor_id);
 `
 
 // addedColumns is the list of columns that didn't exist in the v1 schema

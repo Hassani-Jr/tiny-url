@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"tiny-url/models"
 	"tiny-url/services"
 )
 
@@ -73,6 +74,18 @@ func (h *RotateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// Rotate is admin-token-only (the API key path doesn't go through
+	// this handler), so the actor is always the admin token holder
+	// for the URL being rotated.
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  models.AuditActorAdminToken,
+		ActorID:    code,
+		Action:     models.AuditActionURLTokenRotated,
+		TargetKind: "url",
+		TargetID:   code,
+		RequestID:  requestIDFromContext(r),
+	})
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

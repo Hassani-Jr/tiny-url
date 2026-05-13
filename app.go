@@ -77,6 +77,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	readyHandler := handlers.NewReadyHandler(store, 2*time.Second)
 	apiKeyHandler := handlers.NewAPIKeyHandler(store)
 	myURLsHandler := handlers.NewMyURLsHandler(store, 100)
+	auditHandler := handlers.NewAuditHandler(store, cfg.MetricsToken)
 
 	writeLimiter := middleware.NewLimiter(ctx, cfg.WriteRatePerMin, time.Minute, cfg.TrustProxy)
 	readLimiter := middleware.NewLimiter(ctx, cfg.ReadRatePerMin, time.Minute, cfg.TrustProxy)
@@ -106,6 +107,10 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	appMux.Handle("PATCH /api/keys", apiKeyHandler)
 	appMux.Handle("DELETE /api/keys", apiKeyHandler)
 	appMux.Handle("GET /api/urls", myURLsHandler)
+	// Audit log read: operator-only by design — METRICS_TOKEN gates it
+	// the same way it gates /metrics. Empty token leaves both open
+	// (assumes a private network).
+	appMux.Handle("GET /api/audit", auditHandler)
 	appMux.Handle("GET /api/analytics/{code}", analyticsHandler)
 	appMux.Handle("GET /api/analytics/{code}/clicks", clicksHandler)
 	appMux.Handle("GET /api/analytics/{code}/series", seriesHandler)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"tiny-url/models"
 	"tiny-url/services"
 )
 
@@ -62,5 +63,19 @@ func (h *DeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// Audit AFTER the delete so we know it actually went through.
+	// resolveActor reads from urlMapping (captured pre-delete), so
+	// even though the row is gone the actor attribution stays correct.
+	actorKind, actorID := resolveActor(r, urlMapping, h.storage)
+	logAuditBestEffort(h.storage, models.AuditEvent{
+		ActorKind:  actorKind,
+		ActorID:    actorID,
+		Action:     models.AuditActionURLDelete,
+		TargetKind: "url",
+		TargetID:   code,
+		RequestID:  requestIDFromContext(r),
+	})
+
 	w.WriteHeader(http.StatusNoContent)
 }

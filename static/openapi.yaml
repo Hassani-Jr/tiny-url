@@ -652,6 +652,55 @@ paths:
                   status: { type: string, example: not_ready }
                   error:  { type: string }
 
+  /api/audit:
+    get:
+      tags: [Operations]
+      summary: Audit log (operator-only)
+      description: |
+        Returns state-changing actions newest-first. Each event has an
+        actor (who did it), an action (what they did), and a target
+        (what they did it to). Actions covered today: `url.create`,
+        `url.delete`, `url.patch`, `url.token_rotated`,
+        `api_key.create`, `api_key.revoke`, `api_key.label_updated`.
+
+        Gated by `METRICS_TOKEN` (same credential as `/metrics`). When
+        `METRICS_TOKEN` is unset the endpoint is open — same posture
+        as the existing metrics endpoint for installs on a private
+        network.
+      security:
+        - BearerToken: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:          { type: integer, format: int64 }
+                        at:          { type: string, format: date-time }
+                        actor_kind:  { type: string, enum: [apikey, admin_token, anon, system] }
+                        actor_id:    { type: string }
+                        action:      { type: string }
+                        target_kind: { type: string, enum: [url, api_key] }
+                        target_id:   { type: string }
+                        metadata:    { type: string, description: 'JSON; opaque' }
+                        request_id:  { type: string }
+        '401':
+          description: METRICS_TOKEN is configured and the request lacked or mismatched the token
+
   /metrics:
     get:
       tags: [Operations]
