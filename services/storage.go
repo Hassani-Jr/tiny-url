@@ -38,12 +38,19 @@ type Store interface {
 	// by /api/analytics/{code}/clicks. limit<=0 implies the implementation
 	// default (50).
 	RecentClicks(code string, limit int) ([]models.ClickEvent, error)
-	// Update overwrites the mutable fields of an existing mapping. Pass
-	// originalURL="" to keep the current value; pass clearExpiration=true
-	// to set ExpiresAt to NULL regardless of expiresAt. Immutable fields
-	// (CreatedAt, OwnerTokenHash, ClickCount) are preserved. Returns
-	// ErrNotFound if the code is unknown.
-	Update(code string, originalURL string, expiresAt *time.Time, clearExpiration bool) error
+	// Update overwrites the mutable fields of an existing mapping. Every
+	// "value" pointer is "leave alone if nil"; the explicit Clear* flags
+	// disambiguate "set to zero" from "leave alone" for fields where the
+	// zero value is meaningful (clearing expiration, clearing the password).
+	// Immutable fields (CreatedAt, OwnerTokenHash, ClickCount) are preserved.
+	// Returns ErrNotFound if the code is unknown.
+	Update(code string, fields UpdateFields) error
+	// ClicksByBucket returns click counts grouped into buckets of `bucket`
+	// duration ending at `until` and reaching back `count` buckets. The
+	// oldest bucket is at index 0; the newest at index count-1. Used by the
+	// time-series analytics endpoint to render a sparkline of activity over
+	// arbitrary windows without paging through raw events.
+	ClicksByBucket(code string, until time.Time, bucket time.Duration, count int) ([]int64, error)
 	// RotateToken atomically replaces the owner-token hash for a code.
 	// The handler verifies the OLD token first; this method assumes that
 	// authorisation has already happened. Used to rotate a possibly-leaked
@@ -56,6 +63,23 @@ type Store interface {
 	Ping(ctx context.Context) error
 	StartCleanupRoutine(ctx context.Context, interval time.Duration)
 	Close() error
+}
+
+// UpdateFields is the patch payload passed to Store.Update. Pointer fields
+// distinguish "field not present in the PATCH body" (nil) from "present
+// and set to its zero value" (non-nil pointer to zero). Tags is special-
+// cased: a nil slice means "leave alone" while a non-nil empty slice means
+// "clear all tags". The Clear* booleans cover fields where the zero value
+// has a domain-specific meaning (expiration removal, password removal).
+type UpdateFields struct {
+	OriginalURL     *string
+	ExpiresAt       *time.Time
+	ClearExpiration bool
+	Tags            *[]string // nil = leave alone; non-nil = replace whole list
+	MaxClicks       *int64
+	PasswordHash    []byte
+	PasswordSalt    []byte
+	ClearPassword   bool
 }
 
 // memoryClickCapPerCode bounds the in-memory event log per short code so a
@@ -159,26 +183,67 @@ func (s *MemoryStore) RotateToken(code string, newHash []byte) error {
 	return nil
 }
 
-// Update overwrites mutable fields. originalURL=="" preserves the current
-// URL; clearExpiration=true forces ExpiresAt to nil regardless of expiresAt.
-func (s *MemoryStore) Update(code string, originalURL string, expiresAt *time.Time, clearExpiration bool) error {
+// Update overwrites mutable fields. See UpdateFields for the contract of
+// each pointer / Clear* combination.
+func (s *MemoryStore) Update(code string, f UpdateFields) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m, ok := s.urls[code]
 	if !ok {
 		return ErrNotFound
 	}
-	if originalURL != "" {
-		m.OriginalURL = originalURL
+	if f.OriginalURL != nil {
+		m.OriginalURL = *f.OriginalURL
 	}
 	switch {
-	case clearExpiration:
+	case f.ClearExpiration:
 		m.ExpiresAt = nil
-	case expiresAt != nil:
-		t := *expiresAt
+	case f.ExpiresAt != nil:
+		t := *f.ExpiresAt
 		m.ExpiresAt = &t
 	}
+	if f.Tags != nil {
+		// Copy so the caller's slice can't mutate state outside the lock.
+		m.Tags = append([]string(nil), (*f.Tags)...)
+	}
+	if f.MaxClicks != nil {
+		m.MaxClicks = *f.MaxClicks
+	}
+	switch {
+	case f.ClearPassword:
+		m.PasswordHash = nil
+		m.PasswordSalt = nil
+	case f.PasswordHash != nil:
+		m.PasswordHash = append([]byte(nil), f.PasswordHash...)
+		m.PasswordSalt = append([]byte(nil), f.PasswordSalt...)
+	}
 	return nil
+}
+
+// ClicksByBucket walks the in-memory event log and aggregates into
+// `count` buckets of `bucket` duration ending at `until`. The slice is
+// returned oldest-first.
+func (s *MemoryStore) ClicksByBucket(code string, until time.Time, bucket time.Duration, count int) ([]int64, error) {
+	if count <= 0 || bucket <= 0 {
+		return nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.urls[code]; !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]int64, count)
+	windowStart := until.Add(-time.Duration(count) * bucket)
+	for _, ev := range s.events[code] {
+		if ev.At.Before(windowStart) || !ev.At.Before(until) {
+			continue
+		}
+		idx := int(ev.At.Sub(windowStart) / bucket)
+		if idx >= 0 && idx < count {
+			out[idx]++
+		}
+	}
+	return out, nil
 }
 
 // Ping for the in-memory store is always healthy — the data structure is

@@ -11,13 +11,32 @@ type URLMapping struct {
 	ClickCount     int64      // Updated under the store mutex via atomic.AddInt64; read outside the lock via atomic.LoadInt64 (analytics handler holds no lock).
 	LastAccessed   *time.Time // Last click timestamp
 	OwnerTokenHash []byte     // SHA-256 of the admin token returned at create time; gates analytics access
+	// Tags is an owner-supplied list of arbitrary string labels. Used by the
+	// dashboard for grouping/filtering. The server treats them as opaque —
+	// validation only enforces shape (count + per-tag length).
+	Tags []string
+	// MaxClicks bounds how many redirects this short URL can serve. 0 means
+	// unlimited (the default). Once ClickCount >= MaxClicks the redirect
+	// handler returns 410 Gone the same way it does for expired URLs — the
+	// cleanup goroutine then reaps the row on its next pass.
+	MaxClicks int64
+	// PasswordHash, when non-empty, gates the redirect behind an interstitial
+	// passphrase form. PBKDF2-SHA256 of (password || salt). Empty means the
+	// short URL redirects without prompting.
+	PasswordHash []byte
+	// PasswordSalt is a per-URL 16-byte random salt for PasswordHash. Empty
+	// iff PasswordHash is empty.
+	PasswordSalt []byte
 }
 
 // ShortenRequest represents the request to create a shortened URL
 type ShortenRequest struct {
-	URL            string `json:"url"`
-	ExpirationMins int    `json:"expiration_mins,omitempty"` // Optional, 0 = no expiration
-	CustomCode     string `json:"custom_code,omitempty"`     // Optional, fall back to random when empty
+	URL            string   `json:"url"`
+	ExpirationMins int      `json:"expiration_mins,omitempty"` // Optional, 0 = no expiration
+	CustomCode     string   `json:"custom_code,omitempty"`     // Optional, fall back to random when empty
+	Tags           []string `json:"tags,omitempty"`            // Optional labels; opaque to server
+	MaxClicks      int64    `json:"max_clicks,omitempty"`      // Optional cap; 0 = unlimited
+	Password       string   `json:"password,omitempty"`        // Optional passphrase; gates redirect
 }
 
 // ShortenResponse represents the response containing the shortened URL
@@ -27,6 +46,9 @@ type ShortenResponse struct {
 	OriginalURL string     `json:"original_url"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 	AdminToken  string     `json:"admin_token"` // returned once; required to read analytics for this code
+	Tags        []string   `json:"tags,omitempty"`
+	MaxClicks   int64      `json:"max_clicks,omitempty"`
+	HasPassword bool       `json:"has_password,omitempty"`
 }
 
 // AnalyticsResponse represents analytics data for a shortened URL.
@@ -39,6 +61,9 @@ type AnalyticsResponse struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
 	LastAccessed *time.Time `json:"last_accessed,omitempty"`
+	Tags         []string   `json:"tags,omitempty"`
+	MaxClicks    int64      `json:"max_clicks,omitempty"`
+	HasPassword  bool       `json:"has_password"`
 }
 
 // ErrorResponse represents an error response

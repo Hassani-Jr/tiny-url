@@ -175,7 +175,22 @@ paths:
         (deny-list + runtime SSRF check) so DNS rebinding cannot
         retroactively turn a previously-valid host into a private-network
         target.
+
+        When the short URL has a click cap and the current count meets
+        it, 410 Gone is served — the cleanup goroutine will reap the row
+        on its next pass.
+
+        When the short URL is password-protected, a self-contained HTML
+        form is served (200) instead of the 302. Submitting the form via
+        `POST /{code}` with the correct password completes the redirect.
       responses:
+        '200':
+          description: |
+            Password interstitial form (HTML). Served when the URL is
+            password-protected and the request has not yet submitted a
+            valid password.
+          content:
+            text/html: {}
         '302':
           description: Redirect to original URL
           headers:
@@ -184,11 +199,38 @@ paths:
             X-Request-ID:
               $ref: '#/components/headers/RequestID'
         '404': { description: Short code does not exist }
-        '410': { description: URL has expired }
+        '410': { description: URL has expired or reached its click cap }
         '451':
           description: |
             Destination is on the deny-list, or its host now resolves to
             a private/loopback address (rebinding caught at redirect time).
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      tags: [URLs]
+      summary: Submit password for a password-protected short URL
+      description: |
+        Form-encoded body with field `password`. On match: 302 to the
+        destination (and the click is recorded as a normal click). On
+        mismatch: 401 + the same interstitial form. Failed POSTs do
+        not increment the click counter.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        '302':
+          description: Password accepted; redirect to original URL.
+        '401':
+          description: Password incorrect; interstitial re-rendered.
+          content:
+            text/html: {}
+        '404': { description: Short code does not exist }
+        '410': { description: URL has expired or reached its click cap }
         '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/analytics/{code}:
@@ -256,6 +298,53 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { description: Short code not found }
+        '410': { description: URL has expired }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/analytics/{code}/series:
+    parameters:
+      - $ref: '#/components/parameters/Code'
+    get:
+      tags: [Analytics]
+      summary: Time-series click counts
+      description: |
+        Owner-token-gated. Returns an oldest-first array of click counts
+        bucketed by minute/hour/day for the requested window. Used by the
+        dashboard sparkline; lets clients render longer windows than the
+        raw event log (capped at 200 events / per-process FIFO on memory)
+        can support.
+      security:
+        - BearerToken: []
+      parameters:
+        - in: query
+          name: bucket
+          schema: { type: string, enum: [minute, hour, day], default: hour }
+        - in: query
+          name: range
+          schema: { type: integer, minimum: 1 }
+          description: |
+            Number of buckets, oldest-first. Caps per resolution:
+            minute≤240 (≈4h), hour≤168 (7d), day≤365 (1y).
+            Defaults: 60 / 24 / 30.
+      responses:
+        '200':
+          description: OK
+          headers:
+            Cache-Control:
+              schema: { type: string, default: no-store }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  short_code:   { type: string }
+                  bucket:       { type: string, enum: [minute, hour, day] }
+                  bucket_secs:  { type: integer, description: Bucket width in seconds. }
+                  end:          { type: string, format: date-time, description: Exclusive upper bound of the newest bucket. }
+                  counts:       { type: array, items: { type: integer }, description: Oldest first. }
+        '400': { description: Invalid bucket / range }
+        '401': { description: Missing or invalid admin token }
         '404': { description: Short code not found }
         '410': { description: URL has expired }
         '429': { $ref: '#/components/responses/RateLimited' }
@@ -519,6 +608,20 @@ components:
           type: integer
           minimum: 0
           description: Optional expiration. `0` or omitted → never expires. Capped at `MAX_EXPIRATION_MINUTES`.
+        tags:
+          type: array
+          items: { type: string, maxLength: 32 }
+          maxItems: 16
+          description: Owner-supplied labels. Server normalizes (trims, dedupes) and rejects entries over 32 chars or lists over 16 entries.
+          example: ["work", "campaign-spring"]
+        max_clicks:
+          type: integer
+          minimum: 0
+          description: Cap on total redirects. `0` or omitted → unlimited. Once the count is reached the redirect returns 410 Gone.
+        password:
+          type: string
+          maxLength: 256
+          description: Optional passphrase. When set, the short URL serves an interstitial HTML form before redirecting. Stored as PBKDF2-SHA256 hash + salt.
 
     ShortenResponse:
       type: object
@@ -544,6 +647,14 @@ components:
           type: string
           format: date-time
           nullable: true
+        tags:
+          type: array
+          items: { type: string }
+          description: Canonicalized list as stored on the server.
+        max_clicks:
+          type: integer
+        has_password:
+          type: boolean
 
     AnalyticsResponse:
       type: object
@@ -554,6 +665,9 @@ components:
         created_at:    { type: string, format: date-time }
         expires_at:    { type: string, format: date-time, nullable: true }
         last_accessed: { type: string, format: date-time, nullable: true }
+        tags:          { type: array, items: { type: string } }
+        max_clicks:    { type: integer }
+        has_password:  { type: boolean }
 
     ClicksResponse:
       type: object
@@ -588,7 +702,7 @@ components:
 
     PatchRequest:
       type: object
-      description: At least one of `url` / `expiration_mins` must be present.
+      description: At least one of `url`, `expiration_mins`, `tags`, `max_clicks`, or `password` must be present.
       properties:
         url:
           type: string
@@ -598,6 +712,19 @@ components:
           type: integer
           minimum: 0
           description: '`0` removes expiration; `>0` sets new expiry from now; omitted → unchanged.'
+        tags:
+          type: array
+          items: { type: string, maxLength: 32 }
+          maxItems: 16
+          description: '`[]` clears all tags; non-empty replaces the whole list; omitted → unchanged.'
+        max_clicks:
+          type: integer
+          minimum: 0
+          description: '`0` removes the cap; `>0` sets a new cap (must exceed current click_count); omitted → unchanged.'
+        password:
+          type: string
+          maxLength: 256
+          description: '`""` clears the password; non-empty sets/replaces it; omitted → unchanged.'
 
     PatchResponse:
       type: object

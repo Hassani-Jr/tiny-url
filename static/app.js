@@ -25,18 +25,20 @@
     const LABEL_MAX    = 64;
 
     /**
-     * Sparkline time-range presets. bucketCount × bucketMs = total window.
-     * 1h:   12 buckets × 5 minutes  →  60 minutes
-     * 24h:  24 buckets × 1 hour     →  24 hours
-     * 7d:   28 buckets × 6 hours    →   7 days
-     * 7d's coarseness (28 buckets) is intentional — the clicks endpoint
-     * returns at most 200 most-recent events, so 28 wide buckets visually
-     * smooth out gaps when only a partial week is covered.
+     * Sparkline time-range presets. Each entry maps to the server-side
+     * /api/analytics/{code}/series endpoint via `bucket` and `range`. The
+     * server caps `range` per resolution so we don't ever send out-of-
+     * spec values — see rangeCaps in handlers/series.go.
+     *
+     * Moving away from client-side bucketize() of the raw events log
+     * (capped at 200 events) means the chart stays accurate for high-
+     * volume URLs and unlocks longer windows like 30d.
      */
     const RANGES = {
-        '1h':  { label: '1 h',  bucketCount: 12, bucketMs: 5 * 60 * 1000 },
-        '24h': { label: '24 h', bucketCount: 24, bucketMs: 60 * 60 * 1000 },
-        '7d':  { label: '7 d',  bucketCount: 28, bucketMs: 6 * 60 * 60 * 1000 },
+        '1h':  { label: '1 h',  bucket: 'minute', range: 60  },
+        '24h': { label: '24 h', bucket: 'hour',   range: 24  },
+        '7d':  { label: '7 d',  bucket: 'hour',   range: 168 },
+        '30d': { label: '30 d', bucket: 'day',    range: 30  },
     };
 
     // ---------- DOM refs ---------------------------------------------------
@@ -44,6 +46,7 @@
     const $ = (id) => document.getElementById(id);
     const els = {
         searchInput:    $('searchInput'),
+        tagFilter:      $('tagFilter'),
         importBtn:      $('importBtn'),
         newBtn:         $('newBtn'),
         themeToggle:    $('themeToggle'),
@@ -54,6 +57,9 @@
         urlInput:       $('urlInput'),
         customCodeInput:$('customCodeInput'),
         expirationInput:$('expirationInput'),
+        tagsInput:      $('tagsInput'),
+        maxClicksInput: $('maxClicksInput'),
+        passwordInput:  $('passwordInput'),
         cancelCreateBtn:$('cancelCreateBtn'),
         createBtn:      $('createBtn'),
 
@@ -88,6 +94,7 @@
     /** @type {Map<string, {code, token, status: 'loading'|'active'|'expired'|'gone'|'error', data?, events?, eventsLoading?}>} */
     const rows = new Map();
     let searchQuery = '';
+    let tagFilter = '';
     let sortKey = 'last_accessed';
     let sortDir = 'desc';
     let currentRange = '24h';
@@ -235,10 +242,13 @@
         }
     }
 
-    async function apiCreate({ url, custom_code, expiration_mins }) {
+    async function apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password }) {
         const body = { url };
         if (custom_code) body.custom_code = custom_code;
         if (expiration_mins) body.expiration_mins = expiration_mins;
+        if (tags && tags.length) body.tags = tags;
+        if (max_clicks) body.max_clicks = max_clicks;
+        if (password) body.password = password;
         const r = await fetch('/api/shorten', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
@@ -247,6 +257,13 @@
         const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data.message || `Create failed (${r.status})`);
         return data;
+    }
+    async function apiSeries(code, token, bucket = 'hour', range = 24) {
+        const r = await fetch(`/api/analytics/${encodeURIComponent(code)}/series?bucket=${bucket}&range=${range}`, {
+            headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!r.ok) throw new Error(`Series fetch failed (${r.status})`);
+        return r.json();
     }
     async function apiAnalytics(code, token) {
         const r = await fetch(`/api/analytics/${encodeURIComponent(code)}`, {
@@ -356,6 +373,10 @@
         try {
             const { status, data } = await apiAnalytics(code, row.token);
             if (status === 200 && data) {
+                // Drop cached series for the currently-displayed range so
+                // the next render fetches fresh data — otherwise a live
+                // click wouldn't show up in the spark until manual refresh.
+                if (row.series) delete row.series[currentRange];
                 rows.set(code, { ...row, status: 'active', data });
                 detectActivity(code, data);
             } else if (status === 410) {
@@ -387,6 +408,7 @@
 
         els.tableSummary.textContent = summaryLine(all, filtered);
         renderSortHeaders();
+        refreshTagFilter();
         renderTableBody(sorted);
         updateBulkBar();
     }
@@ -433,11 +455,18 @@
     }
 
     function matchSearch(row) {
+        // Tag filter is AND'd with the text search so a user can narrow by tag
+        // and still type a freetext substring (e.g. tag=work + "stand up").
+        if (tagFilter) {
+            const tags = row.data?.tags || [];
+            if (!tags.includes(tagFilter)) return false;
+        }
         if (!searchQuery) return true;
         const q = searchQuery.toLowerCase();
         if (row.code.toLowerCase().includes(q)) return true;
         if (row.data?.original_url?.toLowerCase().includes(q)) return true;
         if (getLabel(row.code).toLowerCase().includes(q)) return true;
+        if ((row.data?.tags || []).some(t => t.toLowerCase().includes(q))) return true;
         return false;
     }
 
@@ -486,6 +515,16 @@
         codeSpan.className = 'cell-code';
         codeSpan.textContent = row.code;
         tdCode.appendChild(codeSpan);
+        // 🔒 indicator for password-gated URLs. Title is hover-discoverable;
+        // ARIA label is read out loud for screen readers.
+        if (row.data?.has_password) {
+            const lock = document.createElement('span');
+            lock.className = 'cell-lock';
+            lock.textContent = '🔒';
+            lock.title = 'Password-protected';
+            lock.setAttribute('aria-label', 'Password-protected');
+            tdCode.appendChild(lock);
+        }
         const label = getLabel(row.code);
         if (label) {
             const labelSpan = document.createElement('span');
@@ -493,6 +532,21 @@
             labelSpan.textContent = label;
             labelSpan.title = label;
             tdCode.appendChild(labelSpan);
+        }
+        const tags = row.data?.tags || [];
+        for (const t of tags) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'tag-chip';
+            chip.textContent = t;
+            chip.title = `Filter by ${t}`;
+            chip.addEventListener('click', (e) => {
+                e.stopPropagation();
+                tagFilter = (tagFilter === t) ? '' : t;
+                if (els.tagFilter) els.tagFilter.value = tagFilter;
+                render();
+            });
+            tdCode.appendChild(chip);
         }
         tr.appendChild(tdCode);
 
@@ -504,7 +558,14 @@
 
         const tdClicks = document.createElement('td');
         tdClicks.className = 'cell-clicks';
-        tdClicks.textContent = row.data?.click_count ?? '—';
+        if (row.data?.max_clicks > 0) {
+            // Show "used / cap" so the owner sees how close they are to
+            // burning a single-use link. Stays compact when count is 0 by
+            // skipping the slash form.
+            tdClicks.textContent = `${row.data.click_count ?? 0} / ${row.data.max_clicks}`;
+        } else {
+            tdClicks.textContent = row.data?.click_count ?? '—';
+        }
         // Show a brief pulsing dot when click_count just incremented since
         // the previous refresh — gives the dashboard a "this thing is alive"
         // feeling without needing real-time SSE.
@@ -589,18 +650,17 @@
         leftHeader.textContent = `Activity (last ${RANGES[currentRange].label})`;
         left.appendChild(leftHeader);
 
+        // The sparkline pulls from the server time-series endpoint (cached
+        // per range on `row.series`). The breakdown still uses the raw
+        // events list for top-referers / device counts since the series
+        // endpoint only aggregates time, not category.
+        left.appendChild(buildSparkBlock(row));
         if (row.eventsLoading) {
             const p = document.createElement('p');
             p.className = 'muted';
             p.textContent = 'Loading click events…';
             left.appendChild(p);
-        } else if (!row.events) {
-            const p = document.createElement('p');
-            p.className = 'muted';
-            p.textContent = 'No data yet.';
-            left.appendChild(p);
-        } else {
-            left.appendChild(buildSparkBlock(row.events));
+        } else if (row.events) {
             left.appendChild(buildBreakdown(row.events));
         }
         grid.appendChild(left);
@@ -629,15 +689,15 @@
         return tr;
     }
 
-    function buildSparkBlock(eventsResp) {
-        const events = eventsResp.events || [];
+    function buildSparkBlock(row) {
         const cfg = RANGES[currentRange] || RANGES['24h'];
-        const buckets = bucketize(events, currentRange);
+        const series = row.series?.[currentRange];
+        const buckets = series?.counts || [];
         const total = buckets.reduce((s, n) => s + n, 0);
 
         const wrap = document.createElement('div');
 
-        const toggle = buildRangeToggle();
+        const toggle = buildRangeToggle(row);
         wrap.appendChild(toggle);
 
         const sparkRow = document.createElement('div');
@@ -651,18 +711,51 @@
         stats.appendChild(document.createTextNode(`click${total === 1 ? '' : 's'} / ${cfg.label}`));
         sparkRow.appendChild(stats);
 
-        sparkRow.appendChild(sparklineSVG(buckets, cfg));
+        if (series) {
+            sparkRow.appendChild(sparklineSVG(buckets, cfg));
+        } else {
+            const ph = document.createElement('span');
+            ph.className = 'muted';
+            ph.textContent = 'Loading…';
+            sparkRow.appendChild(ph);
+            // Fire-and-forget: result is stashed on the row and a re-render
+            // picks it up. No await here so the rest of the detail block
+            // still renders immediately.
+            loadSeries(row.code, currentRange);
+        }
         wrap.appendChild(sparkRow);
         return wrap;
     }
 
     /**
-     * Build the 1h / 24h / 7d pill toggle. The `currentRange` global is the
-     * single source of truth — all expanded rows render with the same
-     * range, which is the simpler model. (Per-row range would need state
-     * on the row object and a tiny win for a single-user dashboard.)
+     * Fetch /api/analytics/{code}/series for the given range and cache it
+     * on the row. The result lives at row.series[rangeKey] so switching
+     * ranges back-and-forth doesn't re-request the server. Cleared on
+     * refreshOne() so periodic refreshes see fresh data.
      */
-    function buildRangeToggle() {
+    async function loadSeries(code, rangeKey) {
+        const row = rows.get(code);
+        if (!row || row.status !== 'active') return;
+        const cfg = RANGES[rangeKey];
+        if (!cfg) return;
+        row.series = row.series || {};
+        if (row.series[rangeKey] === 'loading') return; // already in flight
+        row.series[rangeKey] = 'loading';
+        try {
+            const data = await apiSeries(code, row.token, cfg.bucket, cfg.range);
+            row.series[rangeKey] = data;
+        } catch (_) {
+            row.series[rangeKey] = { counts: [] };
+        }
+        render();
+    }
+
+    /**
+     * Build the 1h / 24h / 7d / 30d pill toggle. The `currentRange` global
+     * is the single source of truth — all expanded rows render with the
+     * same range, which is the simpler model.
+     */
+    function buildRangeToggle(row) {
         const wrap = document.createElement('div');
         wrap.className = 'range-toggle';
         wrap.setAttribute('role', 'tablist');
@@ -677,32 +770,15 @@
                 e.stopPropagation();
                 if (currentRange === key) return;
                 currentRange = key;
+                // Trigger a fetch for the newly-selected range if we
+                // haven't seen it before — avoids a flicker through the
+                // empty state on the very first switch.
+                if (row && (!row.series || !row.series[key])) loadSeries(row.code, key);
                 render();
             });
             wrap.appendChild(b);
         }
         return wrap;
-    }
-
-    /**
-     * bucketize: return click counts per bucket for the chosen range,
-     * oldest-first, fixed length per the range config. Events outside the
-     * window are silently dropped — the chart shows only what's in scope.
-     */
-    function bucketize(events, range) {
-        const cfg = RANGES[range] || RANGES['24h'];
-        const buckets = new Array(cfg.bucketCount).fill(0);
-        const now = Date.now();
-        const totalMs = cfg.bucketCount * cfg.bucketMs;
-        for (const ev of events) {
-            const t = Date.parse(ev.at);
-            if (!Number.isFinite(t)) continue;
-            const ago = now - t;
-            if (ago < 0 || ago >= totalMs) continue;
-            const idx = cfg.bucketCount - 1 - Math.floor(ago / cfg.bucketMs);
-            buckets[idx] += 1;
-        }
-        return buckets;
     }
 
     function sparklineSVG(buckets, cfg) {
@@ -802,6 +878,56 @@
         return wrap;
     }
 
+    /**
+     * Split a comma-separated tags input into a trimmed, deduped list.
+     * Empty strings are dropped; the server applies the canonical
+     * normalization (case, length cap, max-16) and returns the canonical
+     * list back in the response.
+     */
+    function parseTagsInput(raw) {
+        if (!raw) return [];
+        const seen = new Set();
+        const out = [];
+        for (const piece of raw.split(',')) {
+            const t = piece.trim();
+            if (!t || seen.has(t)) continue;
+            seen.add(t);
+            out.push(t);
+        }
+        return out;
+    }
+
+    /**
+     * Rebuild the tag-filter dropdown from the union of tags across all
+     * rows. Preserves the user's current selection if that tag is still
+     * present after the rebuild; otherwise resets to "All".
+     */
+    function refreshTagFilter() {
+        if (!els.tagFilter) return;
+        const all = new Set();
+        for (const r of rows.values()) {
+            for (const t of (r.data?.tags || [])) all.add(t);
+        }
+        const previous = tagFilter;
+        const sorted = Array.from(all).sort();
+        const optAll = document.createElement('option');
+        optAll.value = '';
+        optAll.textContent = 'All tags';
+        const opts = [optAll];
+        for (const t of sorted) {
+            const o = document.createElement('option');
+            o.value = t;
+            o.textContent = t;
+            opts.push(o);
+        }
+        els.tagFilter.replaceChildren(...opts);
+        if (previous && sorted.includes(previous)) {
+            els.tagFilter.value = previous;
+        } else if (previous) {
+            tagFilter = '';
+        }
+    }
+
     function normalizeReferer(ref) {
         if (!ref) return 'direct';
         try { return new URL(ref).host || 'direct'; } catch (_) { return ref.slice(0, 32); }
@@ -824,8 +950,17 @@
 
         const urlField = makeField('New destination', 'url', row.data?.original_url || '');
         const expField = makeField('Expiration (mins, 0 = remove)', 'number', '');
+        const tagsField = makeField('Tags (comma-separated)', 'text', (row.data?.tags || []).join(', '));
+        const maxField = makeField('Click cap (0 = unlimited)', 'number', row.data?.max_clicks || '');
+        const pwField = makeField(
+            row.data?.has_password ? 'Replace password (leave blank to keep, "off" to clear)' : 'Set password',
+            'text', '');
+        pwField.input.placeholder = row.data?.has_password ? 'leave blank to keep' : '';
         wrap.appendChild(urlField.field);
         wrap.appendChild(expField.field);
+        wrap.appendChild(tagsField.field);
+        wrap.appendChild(maxField.field);
+        wrap.appendChild(pwField.field);
 
         const actions = document.createElement('div');
         actions.className = 'form-actions';
@@ -836,6 +971,29 @@
             const body = {};
             if (newUrl && newUrl !== row.data?.original_url) body.url = newUrl;
             if (newExpRaw !== '') body.expiration_mins = parseInt(newExpRaw, 10);
+
+            // Only send `tags` if the canonicalized list differs from the
+            // current one — avoids gratuitous PATCH writes from a no-op save.
+            const newTags = parseTagsInput(tagsField.input.value);
+            const curTags = row.data?.tags || [];
+            if (!sameTags(newTags, curTags)) body.tags = newTags;
+
+            const newMaxRaw = maxField.input.value.trim();
+            if (newMaxRaw !== '') {
+                const parsed = parseInt(newMaxRaw, 10);
+                if (Number.isFinite(parsed) && parsed !== (row.data?.max_clicks || 0)) {
+                    body.max_clicks = parsed;
+                }
+            }
+
+            // Password edit semantics:
+            //   blank input          → leave alone
+            //   the literal "off"    → clear password (uses PATCH password="")
+            //   anything else        → set/replace password
+            const pwVal = pwField.input.value;
+            if (pwVal === 'off') body.password = '';
+            else if (pwVal !== '') body.password = pwVal;
+
             if (Object.keys(body).length === 0) {
                 toast('Nothing to save.', 'info');
                 return;
@@ -844,6 +1002,7 @@
                 await apiPatch(row.code, row.token, body);
                 toast(`/${row.code} updated.`, 'success');
                 expField.input.value = '';
+                pwField.input.value = '';
                 refreshOne(row.code);
             } catch (err) {
                 toast(err.message, 'error');
@@ -851,6 +1010,14 @@
         }));
         wrap.appendChild(actions);
         return wrap;
+    }
+
+    function sameTags(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
     }
 
     function makeField(label, type, value) {
@@ -1159,12 +1326,16 @@
         const custom_code = els.customCodeInput.value.trim();
         const expRaw = els.expirationInput.value.trim();
         const expiration_mins = expRaw ? parseInt(expRaw, 10) : undefined;
+        const tags = parseTagsInput(els.tagsInput.value);
+        const maxClicksRaw = els.maxClicksInput.value.trim();
+        const max_clicks = maxClicksRaw ? parseInt(maxClicksRaw, 10) : undefined;
+        const password = els.passwordInput.value;
 
         els.createBtn.disabled = true;
         const original = els.createBtn.textContent;
         els.createBtn.textContent = 'Creating…';
         try {
-            const data = await apiCreate({ url, custom_code, expiration_mins });
+            const data = await apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password });
             saveToken(data.short_code, data.admin_token);
             const seed = {
                 short_code: data.short_code,
@@ -1173,6 +1344,9 @@
                 created_at: new Date().toISOString(),
                 expires_at: data.expires_at,
                 last_accessed: null,
+                tags: data.tags || [],
+                max_clicks: data.max_clicks || 0,
+                has_password: !!data.has_password,
             };
             rows.set(data.short_code, { code: data.short_code, token: data.admin_token, status: 'active', data: seed });
             // Seed the snapshot so the FIRST real click after creation is
@@ -1511,6 +1685,12 @@
             searchQuery = els.searchInput.value.trim();
             render();
         });
+        if (els.tagFilter) {
+            els.tagFilter.addEventListener('change', () => {
+                tagFilter = els.tagFilter.value;
+                render();
+            });
+        }
 
         els.bulkDeleteBtn.addEventListener('click', bulkDelete);
         els.bulkClearBtn.addEventListener('click', clearSelection);

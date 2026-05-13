@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,5 +302,111 @@ func TestRedirectHandlerCustomCode(t *testing.T) {
 	location := w.Header().Get("Location")
 	if location != "https://1.1.1.1/long/path" {
 		t.Errorf("Location = %q, want https://1.1.1.1/long/path", location)
+	}
+}
+
+func TestRedirectClickCap(t *testing.T) {
+	// A URL with MaxClicks=2 should redirect twice, then return 410 Gone
+	// without serving the destination URL or recording a click event.
+	store := services.NewMemoryStore()
+	handler := NewRedirectHandler(store, RedirectConfig{})
+	mux := http.NewServeMux()
+	mux.Handle("GET /{code}", handler)
+
+	store.Set("cap", &models.URLMapping{
+		ID:          "cap",
+		OriginalURL: "https://1.1.1.1/",
+		CreatedAt:   time.Now(),
+		MaxClicks:   2,
+	})
+
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("GET", "/cap", nil))
+		if w.Code != http.StatusFound {
+			t.Fatalf("attempt %d: status = %d, want 302", i+1, w.Code)
+		}
+	}
+	// Third hit must be Gone.
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/cap", nil))
+	if w.Code != http.StatusGone {
+		t.Errorf("post-cap status = %d, want 410", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "click limit") {
+		t.Errorf("body should mention click limit, got %q", w.Body.String())
+	}
+}
+
+func TestRedirectPasswordGate(t *testing.T) {
+	// A password-protected URL must:
+	//   - serve an HTML interstitial on GET (no Location header)
+	//   - reject wrong password POST with 401 + form
+	//   - redirect on correct password POST
+	store := services.NewMemoryStore()
+	handler := NewRedirectHandler(store, RedirectConfig{})
+	mux := http.NewServeMux()
+	mux.Handle("GET /{code}", handler)
+	mux.Handle("POST /{code}", handler)
+
+	hash, salt, err := hashPassword("hunter2")
+	if err != nil {
+		t.Fatalf("hashPassword: %v", err)
+	}
+	store.Set("pw", &models.URLMapping{
+		ID:           "pw",
+		OriginalURL:  "https://1.1.1.1/secret",
+		CreatedAt:    time.Now(),
+		PasswordHash: hash,
+		PasswordSalt: salt,
+	})
+
+	// GET → interstitial form, no redirect
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("GET", "/pw", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200 (form)", w.Code)
+	}
+	if w.Header().Get("Location") != "" {
+		t.Errorf("GET set Location header on password form — destination leaked")
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("form Content-Type = %q, want text/html", ct)
+	}
+	if !strings.Contains(w.Body.String(), "password") {
+		t.Errorf("form body missing password field")
+	}
+
+	// Wrong password → 401, still form
+	wrongBody := strings.NewReader("password=wrong")
+	req := httptest.NewRequest("POST", "/pw", wrongBody)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("wrong password status = %d, want 401", w.Code)
+	}
+	if w.Header().Get("Location") != "" {
+		t.Errorf("wrong-password response leaked Location header")
+	}
+
+	// Right password → 302 + redirect to destination
+	rightBody := strings.NewReader("password=hunter2")
+	req = httptest.NewRequest("POST", "/pw", rightBody)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Errorf("correct password status = %d, want 302", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "https://1.1.1.1/secret" {
+		t.Errorf("Location = %q, want destination after correct password", loc)
+	}
+
+	// Correct password counted as a click (only one — the failed POST and
+	// the GET interstitial must NOT have incremented).
+	m, _ := store.Get("pw")
+	if m.ClickCount != 1 {
+		t.Errorf("ClickCount after one successful redirect = %d, want 1 (interstitial GET and wrong-password POST must not count)", m.ClickCount)
 	}
 }

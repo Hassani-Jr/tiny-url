@@ -29,7 +29,49 @@ var (
 	ErrPrivateAddress    = errors.New("URL host resolves to a non-routable address")
 	ErrInvalidCustomCode = errors.New("custom code must be alphanumeric (3-32 chars: letters, digits, '_' or '-')")
 	ErrReservedCode      = errors.New("custom code is reserved")
+	ErrInvalidTag        = errors.New("tag is empty or exceeds maximum length")
+	ErrTooManyTags       = errors.New("too many tags")
 )
+
+// Tag limits are deliberately tight. Tags are owner-supplied labels with no
+// server-side semantics; we just need to bound the storage cost and prevent
+// pathological inputs (gigabyte tags, 10k-tag lists) from blowing up the
+// row size or the JSON column.
+const (
+	MaxTagLength = 32
+	MaxTagsPerURL = 16
+)
+
+// NormalizeTags trims whitespace and drops empties + duplicates while
+// preserving caller order. Returns ErrInvalidTag for any tag that exceeds
+// MaxTagLength and ErrTooManyTags when the deduped result is over the cap.
+// A nil/empty input returns nil — useful so callers can pass through
+// missing-field semantics without a special case.
+func NormalizeTags(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		t := strings.TrimSpace(raw)
+		if t == "" {
+			continue
+		}
+		if len(t) > MaxTagLength {
+			return nil, ErrInvalidTag
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	if len(out) > MaxTagsPerURL {
+		return nil, ErrTooManyTags
+	}
+	return out, nil
+}
 
 // ValidateDestinationURL enforces the rules for a user-supplied destination URL.
 // It rejects non-http(s) schemes, oversized URLs, embedded credentials, hosts

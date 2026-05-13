@@ -79,6 +79,36 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.ExpirationMins = h.maxExpirationMinutes
 	}
 
+	tags, err := services.NormalizeTags(req.Tags)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, tagsMessage(err))
+		return
+	}
+
+	if req.MaxClicks < 0 {
+		writeError(w, http.StatusBadRequest, "max_clicks must be non-negative")
+		return
+	}
+
+	var (
+		pwHash []byte
+		pwSalt []byte
+	)
+	if req.Password != "" {
+		// Cap the password length so an attacker can't make us spend CPU on
+		// a multi-megabyte password before the body-size limit catches up.
+		// 256 bytes is well past any human-typeable passphrase.
+		if len(req.Password) > 256 {
+			writeError(w, http.StatusBadRequest, "password too long")
+			return
+		}
+		pwHash, pwSalt, err = hashPassword(req.Password)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to hash password")
+			return
+		}
+	}
+
 	if shortCode == "" {
 		c, err := services.GenerateShortCode(h.storage)
 		if err != nil {
@@ -107,6 +137,10 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:      expiresAt,
 		ClickCount:     0,
 		OwnerTokenHash: hash,
+		Tags:           tags,
+		MaxClicks:      req.MaxClicks,
+		PasswordHash:   pwHash,
+		PasswordSalt:   pwSalt,
 	}
 	if err := h.storage.Set(shortCode, urlMapping); err != nil {
 		// Defense-in-depth for the Exists/Set TOCTOU race: another writer
@@ -127,6 +161,9 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		OriginalURL: req.URL,
 		ExpiresAt:   expiresAt,
 		AdminToken:  token,
+		Tags:        tags,
+		MaxClicks:   req.MaxClicks,
+		HasPassword: len(pwHash) > 0,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -156,6 +193,17 @@ func customCodeMessage(err error) string {
 		return "Custom code is reserved and cannot be used"
 	default:
 		return "Invalid custom code"
+	}
+}
+
+func tagsMessage(err error) string {
+	switch {
+	case errors.Is(err, services.ErrInvalidTag):
+		return "tag must be 1-32 characters after trimming"
+	case errors.Is(err, services.ErrTooManyTags):
+		return "too many tags (max 16)"
+	default:
+		return "invalid tags"
 	}
 }
 

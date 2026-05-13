@@ -55,6 +55,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	streamHandler := handlers.NewStreamHandler(store, clickStream)
 	analyticsHandler := handlers.NewAnalyticsHandler(store)
 	clicksHandler := handlers.NewClicksHandler(store, 200)
+	seriesHandler := handlers.NewSeriesHandler(store)
 	deleteHandler := handlers.NewDeleteHandler(store)
 	patchHandler := handlers.NewPatchHandler(store, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
 	rotateHandler := handlers.NewRotateHandler(store)
@@ -83,6 +84,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 		writeLimiter.Middleware(rotateHandler))
 	appMux.Handle("GET /api/analytics/{code}", analyticsHandler)
 	appMux.Handle("GET /api/analytics/{code}/clicks", clicksHandler)
+	appMux.Handle("GET /api/analytics/{code}/series", seriesHandler)
 	// Live event stream (SSE). Mounted on appMux so it goes through the
 	// read rate limiter, but a single connection counts once and stays
 	// open — repeat traffic is the click events themselves, not new
@@ -95,6 +97,13 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	// keeps the limiter from being a real obstacle.
 	appMux.Handle("GET /api/badge/{code}", badgeHandler)
 	appMux.Handle("GET /{code}", redirectHandler)
+	// POST /{code} is the submission path for the password interstitial.
+	// Going through the same handler keeps the password verification next
+	// to the redirect logic and lets the form post to its own URL. Not
+	// subject to RequireXRequestedWith — the form is rendered server-side
+	// from a cross-origin click, and the body is a passphrase that an
+	// attacker would need to know to make this request useful anyway.
+	appMux.Handle("POST /{code}", redirectHandler)
 	appMux.Handle("GET /static/", staticAssets.FileServer())
 	appMux.HandleFunc("GET /", staticAssets.ServeIndex)
 

@@ -331,6 +331,85 @@ func TestShortenHandlerExpirationCap(t *testing.T) {
 	}
 }
 
+func TestShortenHandlerTagsNormalized(t *testing.T) {
+	// Tags are trimmed, deduped, and capped. The response and stored mapping
+	// should reflect the normalized list, not the raw input.
+	store := services.NewMemoryStore()
+	handler := NewShortenHandler(store, "http://localhost:8080", 525600, 4096, nil)
+
+	req := models.ShortenRequest{
+		URL:  "https://1.1.1.1/",
+		Tags: []string{"  work  ", "work", "urgent", "  "},
+	}
+	body, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest("POST", "/api/shorten", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+	var resp models.ShortenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Tags) != 2 || resp.Tags[0] != "work" || resp.Tags[1] != "urgent" {
+		t.Errorf("Tags = %v, want [work urgent] after normalize", resp.Tags)
+	}
+}
+
+func TestShortenHandlerMaxClicksAndPassword(t *testing.T) {
+	store := services.NewMemoryStore()
+	handler := NewShortenHandler(store, "http://localhost:8080", 525600, 4096, nil)
+
+	req := models.ShortenRequest{
+		URL:       "https://1.1.1.1/",
+		MaxClicks: 3,
+		Password:  "secret",
+	}
+	body, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest("POST", "/api/shorten", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httpReq)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+	var resp models.ShortenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MaxClicks != 3 || !resp.HasPassword {
+		t.Errorf("response = %+v, want MaxClicks=3 HasPassword=true", resp)
+	}
+	// Verify stored mapping really has a hash + salt (not the plaintext).
+	stored, _ := store.Get(resp.ShortCode)
+	if len(stored.PasswordHash) == 0 || len(stored.PasswordSalt) == 0 {
+		t.Errorf("password not persisted: hash=%d salt=%d", len(stored.PasswordHash), len(stored.PasswordSalt))
+	}
+	if stored.MaxClicks != 3 {
+		t.Errorf("stored MaxClicks = %d, want 3", stored.MaxClicks)
+	}
+}
+
+func TestShortenHandlerRejectsBadTags(t *testing.T) {
+	store := services.NewMemoryStore()
+	handler := NewShortenHandler(store, "http://localhost:8080", 525600, 4096, nil)
+
+	tooLong := strings.Repeat("a", 33)
+	req := models.ShortenRequest{URL: "https://1.1.1.1/", Tags: []string{tooLong}}
+	body, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest("POST", "/api/shorten", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httpReq)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for over-long tag", w.Code)
+	}
+}
+
 func TestShortenHandlerBodySizeLimit(t *testing.T) {
 	store := services.NewMemoryStore()
 	handler := NewShortenHandler(store, "http://localhost:8080", 525600, 100, nil) // 100 byte limit

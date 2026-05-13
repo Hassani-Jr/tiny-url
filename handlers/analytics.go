@@ -59,6 +59,9 @@ func (h *AnalyticsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:    urlMapping.CreatedAt,
 		ExpiresAt:    urlMapping.ExpiresAt,
 		LastAccessed: urlMapping.LastAccessed,
+		Tags:         urlMapping.Tags,
+		MaxClicks:    urlMapping.MaxClicks,
+		HasPassword:  len(urlMapping.PasswordHash) > 0,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

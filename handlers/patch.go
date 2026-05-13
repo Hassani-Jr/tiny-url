@@ -37,9 +37,21 @@ func NewPatchHandler(storage services.Store, maxExpirationMinutes int, maxBodyBy
 //   - ExpirationMins=nil → leave expiration unchanged
 //   - ExpirationMins=0   → REMOVE expiration (URL becomes never-expiring)
 //   - ExpirationMins>0   → set expiration to N minutes from now
+//   - Tags=nil           → leave tags unchanged
+//   - Tags=[]            → clear all tags
+//   - MaxClicks=nil      → leave cap unchanged
+//   - MaxClicks=0        → REMOVE cap (URL becomes unlimited)
+//   - MaxClicks>0        → set new cap. Rejected if <= current click_count
+//                          to avoid silently making the URL instantly Gone.
+//   - Password=nil       → leave password unchanged
+//   - Password=""        → REMOVE password
+//   - Password="..."     → set / replace password
 type patchRequest struct {
-	URL            *string `json:"url"`
-	ExpirationMins *int    `json:"expiration_mins"`
+	URL            *string   `json:"url"`
+	ExpirationMins *int      `json:"expiration_mins"`
+	Tags           *[]string `json:"tags"`
+	MaxClicks      *int64    `json:"max_clicks"`
+	Password       *string   `json:"password"`
 }
 
 func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -58,8 +70,8 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if req.URL == nil && req.ExpirationMins == nil {
-		writeError(w, http.StatusBadRequest, "Provide at least one of url or expiration_mins")
+	if req.URL == nil && req.ExpirationMins == nil && req.Tags == nil && req.MaxClicks == nil && req.Password == nil {
+		writeError(w, http.StatusBadRequest, "Provide at least one of url, expiration_mins, tags, max_clicks, password")
 		return
 	}
 
@@ -116,7 +128,59 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.storage.Update(code, newURL, newExpiresAt, clearExpiration); err != nil {
+	patchFields := services.UpdateFields{
+		ExpiresAt:       newExpiresAt,
+		ClearExpiration: clearExpiration,
+	}
+	if newURL != "" {
+		patchFields.OriginalURL = &newURL
+	}
+
+	if req.Tags != nil {
+		normalized, err := services.NormalizeTags(*req.Tags)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, tagsMessage(err))
+			return
+		}
+		// Normalize a nil result from a non-nil request back to []string{}
+		// so the store sees "clear all tags" instead of "leave alone".
+		if normalized == nil {
+			normalized = []string{}
+		}
+		patchFields.Tags = &normalized
+	}
+
+	if req.MaxClicks != nil {
+		newCap := *req.MaxClicks
+		if newCap < 0 {
+			writeError(w, http.StatusBadRequest, "max_clicks must be non-negative")
+			return
+		}
+		// Rejecting a cap that's already met avoids the surprising "I just
+		// patched my URL and now it's Gone" UX. Owners who really want to
+		// retire a URL should DELETE it.
+		if newCap > 0 && newCap <= mapping.ClickCount {
+			writeError(w, http.StatusBadRequest, "max_clicks must exceed current click_count")
+			return
+		}
+		patchFields.MaxClicks = &newCap
+	}
+
+	if req.Password != nil {
+		if *req.Password == "" {
+			patchFields.ClearPassword = true
+		} else {
+			hash, salt, err := hashPassword(*req.Password)
+			if err != nil {
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			patchFields.PasswordHash = hash
+			patchFields.PasswordSalt = salt
+		}
+	}
+
+	if err := h.storage.Update(code, patchFields); err != nil {
 		if errors.Is(err, services.ErrNotFound) {
 			http.NotFound(w, r)
 			return
@@ -138,5 +202,8 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"short_code":   updated.ID,
 		"original_url": updated.OriginalURL,
 		"expires_at":   updated.ExpiresAt,
+		"tags":         updated.Tags,
+		"max_clicks":   updated.MaxClicks,
+		"has_password": len(updated.PasswordHash) > 0,
 	})
 }

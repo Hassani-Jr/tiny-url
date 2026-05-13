@@ -15,6 +15,9 @@
             </div>
             <div class="topbar-actions">
                 <input type="search" id="searchInput" placeholder="Search code or destination" aria-label="Search short URLs">
+                <select id="tagFilter" class="btn" aria-label="Filter by tag" title="Filter by tag">
+                    <option value="">All tags</option>
+                </select>
                 <button id="importBtn" class="btn">Import</button>
                 <button id="newBtn" class="btn btn-primary">+ New URL</button>
                 <button id="themeToggle" class="btn btn-icon" aria-label="Toggle theme" title="Toggle theme">
@@ -39,6 +42,18 @@
                         <label class="field">
                             <span class="field-label">Expiration (minutes, optional)</span>
                             <input type="number" id="expirationInput" placeholder="never" min="1">
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Tags (comma-separated, optional)</span>
+                            <input type="text" id="tagsInput" placeholder="work, urgent">
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Click cap (optional)</span>
+                            <input type="number" id="maxClicksInput" placeholder="unlimited" min="1">
+                        </label>
+                        <label class="field">
+                            <span class="field-label">Password (optional)</span>
+                            <input type="password" id="passwordInput" placeholder="passphrase" autocomplete="new-password">
                         </label>
                     </div>
                     <div class="form-actions">

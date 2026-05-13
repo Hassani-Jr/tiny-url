@@ -3,9 +3,11 @@ package services
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 	"tiny-url/models"
@@ -55,6 +57,21 @@ CREATE INDEX IF NOT EXISTS idx_click_events_code_time
     ON click_events(short_code, clicked_at DESC);
 `
 
+// addedColumns is the list of columns that didn't exist in the v1 schema
+// and must be present for the current code to operate. SQLite has no
+// IF NOT EXISTS clause for ADD COLUMN before 3.35, but we tolerate a
+// "duplicate column" error from the driver as a no-op so re-running on an
+// already-migrated database is harmless.
+//
+// Each entry is run as a standalone ALTER TABLE; SQLite forbids multiple
+// ADD COLUMNs in one statement.
+var addedColumns = []string{
+	`ALTER TABLE urls ADD COLUMN tags TEXT`,             // JSON array; NULL == no tags
+	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,    // 0/NULL == unlimited
+	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,    // NULL == no password
+	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,    // paired with password_hash
+}
+
 // NewSQLiteStore opens (or creates) a SQLite database at path and applies
 // the schema. WAL journaling and a generous busy_timeout reduce contention
 // when the cleanup goroutine and a request handler write concurrently.
@@ -74,7 +91,22 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite schema: %w", err)
 	}
+	for _, stmt := range addedColumns {
+		if _, err := db.Exec(stmt); err != nil && !isDuplicateColumnErr(err) {
+			_ = db.Close()
+			return nil, fmt.Errorf("sqlite migrate %q: %w", stmt, err)
+		}
+	}
 	return &SQLiteStore{db: db}, nil
+}
+
+// isDuplicateColumnErr matches the modernc.org/sqlite error message emitted
+// when ALTER TABLE ADD COLUMN runs against a column that already exists.
+// There's no sentinel error to compare against; the driver reflects the
+// underlying SQLITE_ERROR string verbatim, so substring match is the
+// documented approach for this driver.
+func isDuplicateColumnErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }
 
 // SetClickRetention configures how long click_events rows are kept by the
@@ -105,15 +137,20 @@ func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	if m.ExpiresAt != nil {
 		expiresAt = sql.NullInt64{Int64: m.ExpiresAt.UnixNano(), Valid: true}
 	}
+	tagsJSON, err := encodeTags(m.Tags)
+	if err != nil {
+		return err
+	}
 	// INSERT OR IGNORE leaves any existing row untouched and signals the
 	// conflict via RowsAffected==0. We surface that as ErrCodeConflict so
 	// the shorten handler can return 409 even when the prior Exists check
 	// passed (the TOCTOU race window between Exists and Set). This is the
 	// non-upsert contract described on MemoryStore.Set.
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash)
-		 VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt)
+		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
+		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
 	)
 	if err != nil {
 		return err
@@ -128,6 +165,38 @@ func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	return nil
 }
 
+// encodeTags marshals an owner-supplied tag slice into the TEXT column.
+// An empty/nil slice maps to SQL NULL so the column stays compact and
+// downstream scanners can treat NULL == "no tags" uniformly.
+func encodeTags(tags []string) (any, error) {
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(tags)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+// nullableInt maps a Go int64 of 0 to SQL NULL — used for max_clicks where
+// 0 has the same semantic as "unset" (unlimited).
+func nullableInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// nullableBlob maps an empty slice to SQL NULL — used for the password
+// hash/salt columns so absence is distinguishable from a zero-length value.
+func nullableBlob(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
 func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 	var (
 		originalURL    string
@@ -136,11 +205,17 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		clickCount     int64
 		lastAccessed   sql.NullInt64
 		ownerTokenHash []byte
+		tagsJSON       sql.NullString
+		maxClicks      sql.NullInt64
+		passwordHash   []byte
+		passwordSalt   []byte
 	)
 	err := s.db.QueryRow(
-		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash
+		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
+		        tags, max_clicks, password_hash, password_salt
 		 FROM urls WHERE short_code = ?`, code,
-	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash)
+	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
+		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -154,6 +229,8 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		CreatedAt:      time.Unix(0, createdAt),
 		ClickCount:     clickCount,
 		OwnerTokenHash: ownerTokenHash,
+		PasswordHash:   passwordHash,
+		PasswordSalt:   passwordSalt,
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -162,6 +239,18 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 	if lastAccessed.Valid {
 		t := time.Unix(0, lastAccessed.Int64)
 		m.LastAccessed = &t
+	}
+	if tagsJSON.Valid && tagsJSON.String != "" {
+		if err := json.Unmarshal([]byte(tagsJSON.String), &m.Tags); err != nil {
+			// Corrupt JSON in the tags column is treated as "no tags" rather
+			// than a hard error — the redirect path shouldn't fail because
+			// of a malformed metadata field.
+			slog.Warn("sqlite: malformed tags JSON", "code", code, "err", err)
+			m.Tags = nil
+		}
+	}
+	if maxClicks.Valid {
+		m.MaxClicks = maxClicks.Int64
 	}
 	if m.ExpiresAt != nil && time.Now().After(*m.ExpiresAt) {
 		return nil, ErrExpired
@@ -302,40 +391,58 @@ func (s *SQLiteStore) RotateToken(code string, newHash []byte) error {
 	return nil
 }
 
-// Update overwrites mutable fields. The handler is expected to combine a
-// PATCH body with the current row state and submit the resulting values, so
-// this method simply runs an UPDATE and reports ErrNotFound on zero rows.
-func (s *SQLiteStore) Update(code string, originalURL string, expiresAt *time.Time, clearExpiration bool) error {
-	// Two SQL paths so we don't have to re-fetch the row just to skip a
-	// no-op write to original_url. The handler typically passes either a
-	// new URL or "" (don't change), so the branch is rarely both at once.
-	var (
-		res sql.Result
-		err error
-	)
+// Update overwrites mutable fields. Each non-nil pointer / Clear flag in
+// UpdateFields adds a `col = ?` fragment; columns not mentioned are left
+// alone. The handler is expected to combine the PATCH body with current row
+// state and submit only the deltas.
+func (s *SQLiteStore) Update(code string, f UpdateFields) error {
+	sets := make([]string, 0, 6)
+	args := make([]any, 0, 7)
+
+	if f.OriginalURL != nil {
+		sets = append(sets, "original_url = ?")
+		args = append(args, *f.OriginalURL)
+	}
 	switch {
-	case originalURL != "" && (clearExpiration || expiresAt != nil):
-		res, err = s.db.Exec(
-			`UPDATE urls SET original_url = ?, expires_at = ? WHERE short_code = ?`,
-			originalURL, expirationToNull(expiresAt, clearExpiration), code,
-		)
-	case originalURL != "":
-		res, err = s.db.Exec(
-			`UPDATE urls SET original_url = ? WHERE short_code = ?`,
-			originalURL, code,
-		)
-	case clearExpiration || expiresAt != nil:
-		res, err = s.db.Exec(
-			`UPDATE urls SET expires_at = ? WHERE short_code = ?`,
-			expirationToNull(expiresAt, clearExpiration), code,
-		)
-	default:
+	case f.ClearExpiration:
+		sets = append(sets, "expires_at = ?")
+		args = append(args, nil)
+	case f.ExpiresAt != nil:
+		sets = append(sets, "expires_at = ?")
+		args = append(args, f.ExpiresAt.UnixNano())
+	}
+	if f.Tags != nil {
+		enc, err := encodeTags(*f.Tags)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, "tags = ?")
+		args = append(args, enc)
+	}
+	if f.MaxClicks != nil {
+		sets = append(sets, "max_clicks = ?")
+		args = append(args, nullableInt(*f.MaxClicks))
+	}
+	switch {
+	case f.ClearPassword:
+		sets = append(sets, "password_hash = ?", "password_salt = ?")
+		args = append(args, nil, nil)
+	case f.PasswordHash != nil:
+		sets = append(sets, "password_hash = ?", "password_salt = ?")
+		args = append(args, nullableBlob(f.PasswordHash), nullableBlob(f.PasswordSalt))
+	}
+
+	if len(sets) == 0 {
 		// Nothing to change — treat as success if the row exists.
 		if !s.Exists(code) {
 			return ErrNotFound
 		}
 		return nil
 	}
+	args = append(args, code)
+	res, err := s.db.Exec(
+		`UPDATE urls SET `+strings.Join(sets, ", ")+` WHERE short_code = ?`, args...,
+	)
 	if err != nil {
 		return err
 	}
@@ -347,6 +454,46 @@ func (s *SQLiteStore) Update(code string, originalURL string, expiresAt *time.Ti
 		return ErrNotFound
 	}
 	return nil
+}
+
+// ClicksByBucket aggregates click_events into fixed-width buckets so the
+// analytics UI can draw a sparkline over a configurable window without
+// pulling every raw event. The bucket boundaries are computed in SQL via
+// integer division of clicked_at by the bucket width (both in nanoseconds);
+// the result slice is positional (oldest at index 0), matching the
+// MemoryStore implementation.
+func (s *SQLiteStore) ClicksByBucket(code string, until time.Time, bucket time.Duration, count int) ([]int64, error) {
+	if count <= 0 || bucket <= 0 {
+		return nil, nil
+	}
+	if !s.Exists(code) {
+		return nil, ErrNotFound
+	}
+	windowStart := until.Add(-time.Duration(count) * bucket)
+	rows, err := s.db.Query(
+		`SELECT (clicked_at - ?) / ? AS bucket_idx, COUNT(*)
+		 FROM click_events
+		 WHERE short_code = ? AND clicked_at >= ? AND clicked_at < ?
+		 GROUP BY bucket_idx`,
+		windowStart.UnixNano(), bucket.Nanoseconds(), code,
+		windowStart.UnixNano(), until.UnixNano(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]int64, count)
+	for rows.Next() {
+		var idx, n int64
+		if err := rows.Scan(&idx, &n); err != nil {
+			return nil, err
+		}
+		if idx >= 0 && idx < int64(count) {
+			out[idx] = n
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *SQLiteStore) StartCleanupRoutine(ctx context.Context, interval time.Duration) {
@@ -395,14 +542,3 @@ func nullableText(s string) any {
 	return s
 }
 
-// expirationToNull packages the patch's expiration intent into the value
-// passed to UPDATE. clearExpiration takes priority over expiresAt.
-func expirationToNull(t *time.Time, clear bool) any {
-	if clear {
-		return nil
-	}
-	if t == nil {
-		return nil
-	}
-	return t.UnixNano()
-}
