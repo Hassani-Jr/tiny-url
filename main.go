@@ -193,10 +193,23 @@ func openStore(cfg config.Config) (services.Store, error) {
 			s.SetClickRetention(time.Duration(cfg.ClickRetentionDays) * 24 * time.Hour)
 		}
 		return s, nil
+	case "postgres":
+		if cfg.PostgresDSN == "" {
+			return nil, fmt.Errorf("STORAGE_BACKEND=postgres but POSTGRES_DSN is not set")
+		}
+		slog.Info("storage backend", "kind", "postgres")
+		s, err := services.NewPostgresStore(cfg.PostgresDSN)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.ClickRetentionDays > 0 {
+			s.SetClickRetention(time.Duration(cfg.ClickRetentionDays) * 24 * time.Hour)
+		}
+		return s, nil
 	case "", "memory":
 		slog.Info("storage backend", "kind", "memory", "note", "data is lost on restart")
 		return services.NewMemoryStore(), nil
 	default:
-		return nil, fmt.Errorf("unknown STORAGE_BACKEND %q (want memory|sqlite)", cfg.StorageBackend)
+		return nil, fmt.Errorf("unknown STORAGE_BACKEND %q (want memory|sqlite|postgres)", cfg.StorageBackend)
 	}
 }

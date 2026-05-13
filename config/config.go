@@ -30,8 +30,14 @@ type Config struct {
 	// pause, in-flight requests during a deploy hit a closed listener and
 	// produce 5xx blips. 0 disables — useful for tests.
 	ShutdownDrain  time.Duration
-	StorageBackend string // "memory" (default) or "sqlite"
+	StorageBackend string // "memory" (default), "sqlite", or "postgres"
 	SQLitePath     string
+	// PostgresDSN is the connection string for STORAGE_BACKEND=postgres.
+	// Accepts both URL form (postgres://user:pass@host/db?sslmode=…)
+	// and key-value form (host=… user=… password=… dbname=… …).
+	// Sourced from POSTGRES_DSN if set, otherwise from the standard
+	// PGHOST/PGUSER/PGDATABASE chain via the driver.
+	PostgresDSN string
 	// DenyHosts is a comma-separated list of hostnames to refuse as
 	// destination URLs. Subdomains of each entry are also blocked.
 	DenyHosts []string
@@ -82,6 +88,7 @@ func Load() Config {
 		ShutdownDrain:        time.Duration(getEnvInt("SHUTDOWN_DRAIN_SECS", 5)) * time.Second,
 		StorageBackend:       getEnv("STORAGE_BACKEND", "memory"),
 		SQLitePath:           getEnv("SQLITE_PATH", "tiny-url.db"),
+		PostgresDSN:          os.Getenv("POSTGRES_DSN"),
 		DenyHosts:            splitCSV(os.Getenv("DENY_HOSTS")),
 		DenyHostsFile:        os.Getenv("DENY_HOSTS_FILE"),
 		LogClickIP:           os.Getenv("CLICK_LOG_IP") == "true",

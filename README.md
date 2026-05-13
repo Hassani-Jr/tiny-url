@@ -470,8 +470,9 @@ All settings are loaded from environment variables with sensible defaults. No co
 |---|---|---|
 | `PORT` | `8080` | Port to listen on |
 | `BASE_URL` | `http://localhost:8080` | Base URL for short links (e.g., `https://short.example.com`) |
-| `STORAGE_BACKEND` | `memory` | Storage backend: `memory` or `sqlite` |
+| `STORAGE_BACKEND` | `memory` | Storage backend: `memory`, `sqlite`, or `postgres` |
 | `SQLITE_PATH` | `tiny-url.db` | Path to SQLite database file (only used if `STORAGE_BACKEND=sqlite`) |
+| `POSTGRES_DSN` | _(unset)_ | Postgres connection string (only used if `STORAGE_BACKEND=postgres`). Either URL form (`postgres://user:pw@host:5432/dbname?sslmode=require`) or key-value form. |
 | `MAX_EXPIRATION_MINUTES` | `525600` | Maximum expiration time in minutes (default = 1 year) |
 | `WRITE_RATE_PER_MIN` | `10` | Rate limit for POST /api/shorten (per IP, per minute) |
 | `READ_RATE_PER_MIN` | `120` | Rate limit for GET requests (per IP, per minute) |
