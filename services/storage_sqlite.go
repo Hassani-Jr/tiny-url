@@ -66,10 +66,10 @@ CREATE INDEX IF NOT EXISTS idx_click_events_code_time
 // Each entry is run as a standalone ALTER TABLE; SQLite forbids multiple
 // ADD COLUMNs in one statement.
 var addedColumns = []string{
-	`ALTER TABLE urls ADD COLUMN tags TEXT`,             // JSON array; NULL == no tags
-	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,    // 0/NULL == unlimited
-	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,    // NULL == no password
-	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,    // paired with password_hash
+	`ALTER TABLE urls ADD COLUMN tags TEXT`,          // JSON array; NULL == no tags
+	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`, // 0/NULL == unlimited
+	`ALTER TABLE urls ADD COLUMN password_hash BLOB`, // NULL == no password
+	`ALTER TABLE urls ADD COLUMN password_salt BLOB`, // paired with password_hash
 }
 
 // NewSQLiteStore opens (or creates) a SQLite database at path and applies
@@ -541,4 +541,3 @@ func nullableText(s string) any {
 	}
 	return s
 }
-

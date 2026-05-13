@@ -38,7 +38,7 @@ var (
 // pathological inputs (gigabyte tags, 10k-tag lists) from blowing up the
 // row size or the JSON column.
 const (
-	MaxTagLength = 32
+	MaxTagLength  = 32
 	MaxTagsPerURL = 16
 )
 

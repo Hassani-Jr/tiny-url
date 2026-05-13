@@ -250,7 +250,6 @@ func runStoreContractTests(t *testing.T, newStore func(t *testing.T) Store) {
 	})
 }
 
-
 func TestMemoryStoreContract(t *testing.T) {
 	runStoreContractTests(t, func(t *testing.T) Store { return NewMemoryStore() })
 }

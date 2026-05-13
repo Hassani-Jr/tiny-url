@@ -42,7 +42,7 @@ func NewPatchHandler(storage services.Store, maxExpirationMinutes int, maxBodyBy
 //   - MaxClicks=nil      → leave cap unchanged
 //   - MaxClicks=0        → REMOVE cap (URL becomes unlimited)
 //   - MaxClicks>0        → set new cap. Rejected if <= current click_count
-//                          to avoid silently making the URL instantly Gone.
+//     to avoid silently making the URL instantly Gone.
 //   - Password=nil       → leave password unchanged
 //   - Password=""        → REMOVE password
 //   - Password="..."     → set / replace password

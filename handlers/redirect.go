@@ -151,10 +151,10 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // Two flows:
 //
-//   GET  → render the form (no submission yet).
-//   POST → read "password" from the form body and verify. On success,
-//          fall through to the normal redirect path. On failure, re-render
-//          the form with a non-leaking generic error.
+//	GET  → render the form (no submission yet).
+//	POST → read "password" from the form body and verify. On success,
+//	       fall through to the normal redirect path. On failure, re-render
+//	       the form with a non-leaking generic error.
 //
 // The form is rendered fresh on every request — there is no cookie or
 // session. Each click of a password-protected link prompts again. This is

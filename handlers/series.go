@@ -37,12 +37,12 @@ func NewSeriesHandler(storage services.Store) *SeriesHandler {
 // stays under ~10KB JSON regardless of resolution, and so a coarse
 // resolution can't be used to scan an unbounded amount of history.
 var rangeCaps = map[string]struct {
-	bucket  time.Duration
-	defN    int
-	maxN    int
+	bucket time.Duration
+	defN   int
+	maxN   int
 }{
-	"minute": {bucket: time.Minute, defN: 60, maxN: 240},   // up to 4h
-	"hour":   {bucket: time.Hour, defN: 24, maxN: 168},     // up to 7d
+	"minute": {bucket: time.Minute, defN: 60, maxN: 240},    // up to 4h
+	"hour":   {bucket: time.Hour, defN: 24, maxN: 168},      // up to 7d
 	"day":    {bucket: 24 * time.Hour, defN: 30, maxN: 365}, // up to 1y
 }
 
