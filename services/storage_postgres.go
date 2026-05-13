@@ -106,6 +106,8 @@ var postgresMigrations = []string{
 	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_image TEXT`,
 	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_description TEXT`,
 	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_fetched_at BIGINT`,
+	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS destinations TEXT`,
+	`ALTER TABLE click_events ADD COLUMN IF NOT EXISTS destination_url TEXT`,
 }
 
 // NewPostgresStore opens a connection pool against dsn and applies the
@@ -169,18 +171,22 @@ func (s *PostgresStore) Set(code string, m *models.URLMapping) error {
 	if m.PreviewFetchedAt != nil {
 		previewFetched = m.PreviewFetchedAt.UnixNano()
 	}
+	destsJSON, err := encodeDestinations(m.Destinations)
+	if err != nil {
+		return err
+	}
 	// ON CONFLICT DO NOTHING is Postgres's INSERT-IGNORE; we read
 	// RowsAffected to detect the collision, matching the SQLite
 	// "INSERT OR IGNORE → RowsAffected==0" contract.
 	res, err := s.db.Exec(
-		`INSERT INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at)
-		 VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		`INSERT INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at, destinations)
+		 VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		 ON CONFLICT (short_code) DO NOTHING`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
 		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
 		nullableText(m.WebhookURL), nullableBlob(m.WebhookSecret), nullableInt(m.APIKeyID),
 		nullableText(m.PreviewTitle), nullableText(m.PreviewImage), nullableText(m.PreviewDescription),
-		previewFetched,
+		previewFetched, destsJSON,
 	)
 	if err != nil {
 		return err
@@ -214,15 +220,16 @@ func (s *PostgresStore) Get(code string) (*models.URLMapping, error) {
 		previewImage   sql.NullString
 		previewDesc    sql.NullString
 		previewFetched sql.NullInt64
+		destsJSON      sql.NullString
 	)
 	err := s.db.QueryRow(
 		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
 		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id,
-		        preview_title, preview_image, preview_description, preview_fetched_at
+		        preview_title, preview_image, preview_description, preview_fetched_at, destinations
 		 FROM urls WHERE short_code = $1`, code,
 	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
 		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID,
-		&previewTitle, &previewImage, &previewDesc, &previewFetched)
+		&previewTitle, &previewImage, &previewDesc, &previewFetched, &destsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -248,6 +255,12 @@ func (s *PostgresStore) Get(code string) (*models.URLMapping, error) {
 	if previewFetched.Valid {
 		t := time.Unix(0, previewFetched.Int64)
 		m.PreviewFetchedAt = &t
+	}
+	if destsJSON.Valid && destsJSON.String != "" {
+		if err := json.Unmarshal([]byte(destsJSON.String), &m.Destinations); err != nil {
+			slog.Warn("postgres: malformed destinations JSON", "code", code, "err", err)
+			m.Destinations = nil
+		}
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -325,9 +338,9 @@ func (s *PostgresStore) RecordClick(code string, ev models.ClickEvent) error {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class, country)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass), nullableText(ev.Country),
+		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class, country, destination_url)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass), nullableText(ev.Country), nullableText(ev.DestinationURL),
 	); err != nil {
 		return err
 	}
@@ -343,7 +356,7 @@ func (s *PostgresStore) RecentClicks(code string, limit int) ([]models.ClickEven
 		limit = 50
 	}
 	rows, err := s.db.Query(
-		`SELECT clicked_at, ip_hash, referer, ua_class, country
+		`SELECT clicked_at, ip_hash, referer, ua_class, country, destination_url
 		 FROM click_events WHERE short_code = $1
 		 ORDER BY clicked_at DESC LIMIT $2`,
 		code, limit,
@@ -355,18 +368,19 @@ func (s *PostgresStore) RecentClicks(code string, limit int) ([]models.ClickEven
 	out := make([]models.ClickEvent, 0)
 	for rows.Next() {
 		var (
-			ts                                int64
-			ipHash, referer, uaClass, country sql.NullString
+			ts                                      int64
+			ipHash, referer, uaClass, country, dest sql.NullString
 		)
-		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass, &country); err != nil {
+		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass, &country, &dest); err != nil {
 			return nil, err
 		}
 		out = append(out, models.ClickEvent{
-			At:      time.Unix(0, ts),
-			IPHash:  ipHash.String,
-			Referer: referer.String,
-			UAClass: uaClass.String,
-			Country: country.String,
+			At:             time.Unix(0, ts),
+			IPHash:         ipHash.String,
+			Referer:        referer.String,
+			UAClass:        uaClass.String,
+			Country:        country.String,
+			DestinationURL: dest.String,
 		})
 	}
 	return out, rows.Err()
@@ -465,6 +479,14 @@ func (s *PostgresStore) Update(code string, f UpdateFields) error {
 	if f.SetPreviewFetched {
 		sets = append(sets, "preview_fetched_at = "+next())
 		args[len(args)-1] = time.Now().UnixNano()
+	}
+	if f.Destinations != nil {
+		enc, err := encodeDestinations(*f.Destinations)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, "destinations = "+next())
+		args[len(args)-1] = enc
 	}
 
 	if len(sets) == 0 {

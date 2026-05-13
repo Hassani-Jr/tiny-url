@@ -880,6 +880,22 @@ components:
             `X-Tinyurl-Signature: sha256=<hex>` header against the raw
             request body. 5xx responses are retried (3 attempts, 200/800
             ms backoff); 4xx is treated as terminal misconfiguration.
+        destinations:
+          type: array
+          maxItems: 10
+          description: |
+            Weighted routing pool for A/B tests. When non-empty, each
+            click is routed to one of the listed URLs picked
+            proportionally to `weight`. Empty (the default) means the
+            short URL routes to `url` only. Each entry's URL is
+            validated against the same SSRF / deny-list / scheme rules
+            as `url`.
+          items:
+            type: object
+            required: [url, weight]
+            properties:
+              url:    { type: string, format: uri }
+              weight: { type: integer, minimum: 1, maximum: 100 }
 
     ShortenResponse:
       type: object
@@ -938,6 +954,14 @@ components:
         preview_image:        { type: string, format: uri, description: 'og:image / twitter:image URL.' }
         preview_description:  { type: string, description: 'og:description / meta description, truncated to 512 chars.' }
         preview_fetched_at:   { type: string, format: date-time, nullable: true, description: 'When the unfurl was attempted (success OR failure). Null = never attempted.' }
+        destinations:
+          type: array
+          description: 'Weighted A/B routing pool, when one is configured. Empty for single-destination URLs (the common case).'
+          items:
+            type: object
+            properties:
+              url:    { type: string, format: uri }
+              weight: { type: integer }
 
     ClicksResponse:
       type: object
@@ -975,6 +999,14 @@ components:
             ISO-3166-1 alpha-2 country code resolved from the client IP
             via the embedded MaxMind GeoLite2 database. Empty when
             geoip is disabled, the IP is private, or no match exists.
+        destination_url:
+          type: string
+          format: uri
+          description: |
+            Which destination was served on this click. Empty for
+            single-destination URLs; populated only when the URL had a
+            weighted `destinations` pool at click time so analytics
+            can compute per-destination share.
 
     PatchRequest:
       type: object

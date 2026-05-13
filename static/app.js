@@ -806,6 +806,11 @@
         // per range on `row.series`). The breakdown still uses the raw
         // events list for top-referers / device counts since the series
         // endpoint only aggregates time, not category.
+        // Show the routing pool above the spark when this URL has A/B
+        // destinations configured — the per-destination breakdown is
+        // the most useful "this experiment is running" affordance.
+        const pool = buildDestinationsBlock(row);
+        if (pool) left.appendChild(pool);
         left.appendChild(buildSparkBlock(row));
         if (row.eventsLoading) {
             const p = document.createElement('p');
@@ -842,6 +847,57 @@
             loadEvents(row.code);
         }
         return tr;
+    }
+
+    /**
+     * Render the A/B routing pool with weights AND per-destination
+     * click counts derived from the recent events log. Hidden when
+     * the URL has no pool (the common single-destination case).
+     *
+     * The breakdown uses the same events array as buildBreakdown
+     * (max 200 most-recent events) so it auto-refreshes alongside
+     * the rest of the row.
+     */
+    function buildDestinationsBlock(row) {
+        const pool = row.data?.destinations || [];
+        if (pool.length === 0) return null;
+
+        const wrap = document.createElement('div');
+        wrap.style.marginBottom = '0.75rem';
+        const h = document.createElement('h3');
+        h.textContent = 'A/B destinations';
+        wrap.appendChild(h);
+
+        // Tally how many of the recent events landed on each
+        // destination. Empty destination_url means the click is older
+        // than the routing pool — count it as "(pre-A/B)".
+        const counts = new Map();
+        const events = row.events?.events || [];
+        for (const e of events) {
+            const k = e.destination_url || '';
+            counts.set(k, (counts.get(k) || 0) + 1);
+        }
+        const totalRecent = events.length;
+
+        const ul = document.createElement('ul');
+        ul.className = 'device-list';
+        for (const d of pool) {
+            const li = document.createElement('li');
+            const left = document.createElement('span');
+            left.className = 'ref-host';
+            left.title = d.url;
+            left.textContent = `${d.url} (w=${d.weight})`;
+            const right = document.createElement('span');
+            right.className = 'dev-count';
+            const c = counts.get(d.url) || 0;
+            const pct = totalRecent > 0 ? Math.round((c / totalRecent) * 100) : 0;
+            right.textContent = totalRecent > 0 ? `${c} (${pct}%)` : '—';
+            li.appendChild(left);
+            li.appendChild(right);
+            ul.appendChild(li);
+        }
+        wrap.appendChild(ul);
+        return wrap;
     }
 
     function buildSparkBlock(row) {

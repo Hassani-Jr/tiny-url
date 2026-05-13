@@ -374,6 +374,62 @@ func TestRedirectFiresWebhook(t *testing.T) {
 	}
 }
 
+func TestRedirectABRoutingPicksFromPool(t *testing.T) {
+	// A URL with a 1:1 destination pool should route to one of the
+	// two URLs (never to the OriginalURL) and stamp the chosen one
+	// on the click event so analytics can break it down by
+	// destination later.
+	store := services.NewMemoryStore()
+	handler := NewRedirectHandler(store, RedirectConfig{})
+	mux := http.NewServeMux()
+	mux.Handle("GET /{code}", handler)
+
+	store.Set("ab", &models.URLMapping{
+		ID:          "ab",
+		OriginalURL: "https://1.1.1.1/primary",
+		CreatedAt:   time.Now(),
+		Destinations: []models.Destination{
+			{URL: "https://1.1.1.1/a", Weight: 1},
+			{URL: "https://1.1.1.1/b", Weight: 1},
+		},
+	})
+
+	hitA, hitB := 0, 0
+	for i := 0; i < 20; i++ {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest("GET", "/ab", nil))
+		if w.Code != http.StatusFound {
+			t.Fatalf("attempt %d: status = %d", i, w.Code)
+		}
+		switch w.Header().Get("Location") {
+		case "https://1.1.1.1/a":
+			hitA++
+		case "https://1.1.1.1/b":
+			hitB++
+		case "https://1.1.1.1/primary":
+			t.Errorf("redirected to OriginalURL when pool is set — picker bypass")
+		default:
+			t.Errorf("unexpected Location %q", w.Header().Get("Location"))
+		}
+	}
+	if hitA+hitB != 20 {
+		t.Errorf("counted %d a + %d b, want 20 total", hitA, hitB)
+	}
+	// Each destination should win at least once across 20 picks at
+	// 1:1 weighting (probability of all-one-side is 1/2^20).
+	if hitA == 0 || hitB == 0 {
+		t.Errorf("imbalanced split %d/%d — picker may be deterministic", hitA, hitB)
+	}
+
+	// Click events must carry which destination served each click.
+	events, _ := store.RecentClicks("ab", 50)
+	for _, ev := range events {
+		if ev.DestinationURL == "" {
+			t.Errorf("click event missing destination_url: %+v", ev)
+		}
+	}
+}
+
 func TestRedirectClickCap(t *testing.T) {
 	// A URL with MaxClicks=2 should redirect twice, then return 410 Gone
 	// without serving the destination URL or recording a click event.

@@ -60,6 +60,10 @@ type patchRequest struct {
 	//                   fresh secret is generated and returned.
 	WebhookURL    *string `json:"webhook_url"`
 	RotateWebhook bool    `json:"webhook_rotate_secret"`
+	// Destinations=nil  → leave alone
+	// Destinations=[]   → clear pool, revert to single-destination via OriginalURL
+	// Destinations=...  → replace whole pool, all entries validated like the primary URL
+	Destinations *[]models.Destination `json:"destinations"`
 }
 
 func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,8 +82,8 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if req.URL == nil && req.ExpirationMins == nil && req.Tags == nil && req.MaxClicks == nil && req.Password == nil && req.WebhookURL == nil && !req.RotateWebhook {
-		writeError(w, http.StatusBadRequest, "Provide at least one of url, expiration_mins, tags, max_clicks, password, webhook_url")
+	if req.URL == nil && req.ExpirationMins == nil && req.Tags == nil && req.MaxClicks == nil && req.Password == nil && req.WebhookURL == nil && !req.RotateWebhook && req.Destinations == nil {
+		writeError(w, http.StatusBadRequest, "Provide at least one of url, expiration_mins, tags, max_clicks, password, webhook_url, destinations")
 		return
 	}
 
@@ -220,7 +224,23 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				patchFields.WebhookSecret = mapping.WebhookSecret
 			}
 		}
-	} else if req.RotateWebhook {
+	}
+	if req.Destinations != nil {
+		dests, derr := services.ValidateDestinations(*req.Destinations, h.denyList)
+		if derr != nil {
+			writeError(w, http.StatusBadRequest, "destinations: "+destinationsMessage(derr))
+			return
+		}
+		// nil-vs-empty: a non-nil request with a validated nil result
+		// means the caller asked to CLEAR the pool. Normalize so the
+		// store sees a real (empty) slice instead of "leave alone".
+		if dests == nil {
+			dests = []models.Destination{}
+		}
+		patchFields.Destinations = &dests
+	}
+
+	if req.RotateWebhook && req.WebhookURL == nil {
 		// Rotate without changing the URL. Requires an existing webhook.
 		if mapping.WebhookURL == "" {
 			writeError(w, http.StatusBadRequest, "webhook_rotate_secret requires an existing webhook_url")
@@ -280,6 +300,9 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.RotateWebhook {
 		changed = append(changed, "webhook_rotate_secret")
 	}
+	if req.Destinations != nil {
+		changed = append(changed, "destinations")
+	}
 	metaBytes, _ := json.Marshal(map[string]any{"fields": changed})
 	actorKind, actorID := resolveActor(r, mapping, h.storage)
 	logAuditBestEffort(h.storage, models.AuditEvent{
@@ -300,6 +323,7 @@ func (h *PatchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"max_clicks":   updated.MaxClicks,
 		"has_password": len(updated.PasswordHash) > 0,
 		"webhook_url":  updated.WebhookURL,
+		"destinations": updated.Destinations,
 	}
 	// Only attach the secret when one was generated on this PATCH — this
 	// is the only time the plaintext key leaves the server, mirroring

@@ -104,6 +104,17 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Pick the destination: when the URL has a routing pool the
+	// redirect picks weighted-randomly per click; otherwise it goes
+	// to OriginalURL. The chosen URL is also stamped on the click
+	// event so analytics can show per-destination share.
+	targetURL := urlMapping.OriginalURL
+	if len(urlMapping.Destinations) > 0 {
+		if picked := services.PickDestination(urlMapping.Destinations, nil); picked != nil {
+			targetURL = picked.URL
+		}
+	}
+
 	// Re-evaluate the destination at redirect time. Two checks:
 	//   1. Deny-list — operators may have blocked the host AFTER creation.
 	//   2. Runtime host validation — the host's DNS may have been flipped
@@ -111,7 +122,7 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//      threat). Re-resolving here closes that window.
 	// Both failures return 451 so the user sees a uniform "no longer
 	// available" rather than learning which control fired.
-	if u, perr := url.Parse(urlMapping.OriginalURL); perr == nil {
+	if u, perr := url.Parse(targetURL); perr == nil {
 		host := u.Hostname()
 		if h.cfg.DenyList != nil && h.cfg.DenyList.Contains(host) {
 			w.WriteHeader(http.StatusUnavailableForLegalReasons)
@@ -139,6 +150,12 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		At:      time.Now(),
 		Referer: services.TruncateReferer(r.Header.Get("Referer")),
 		UAClass: services.ClassifyUserAgent(r.Header.Get("User-Agent")),
+	}
+	// Record which destination was served — only meaningful when the
+	// URL has a routing pool. Single-destination URLs leave this empty
+	// so the click_events column stays NULL for the common case.
+	if len(urlMapping.Destinations) > 0 {
+		ev.DestinationURL = targetURL
 	}
 	// Resolve the client IP once for both IP-hash and geo-lookup so we
 	// don't pay the parse cost twice. middleware.ClientIP honours the
@@ -168,7 +185,7 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	http.Redirect(w, r, urlMapping.OriginalURL, http.StatusFound)
+	http.Redirect(w, r, targetURL, http.StatusFound)
 }
 
 // passwordOK returns true when the request has presented the correct

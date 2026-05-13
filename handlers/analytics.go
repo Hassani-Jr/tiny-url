@@ -67,6 +67,7 @@ func (h *AnalyticsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		PreviewImage:       urlMapping.PreviewImage,
 		PreviewDescription: urlMapping.PreviewDescription,
 		PreviewFetchedAt:   urlMapping.PreviewFetchedAt,
+		Destinations:       urlMapping.Destinations,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

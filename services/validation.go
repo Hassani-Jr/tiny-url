@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"tiny-url/models"
 )
 
 const (
@@ -21,16 +23,26 @@ const (
 )
 
 var (
-	ErrInvalidURL        = errors.New("invalid URL")
-	ErrInvalidScheme     = errors.New("URL must use http or https scheme")
-	ErrURLTooLong        = errors.New("URL exceeds maximum length")
-	ErrUserInfo          = errors.New("URL must not contain user credentials")
-	ErrInvalidHost       = errors.New("URL has no resolvable host")
-	ErrPrivateAddress    = errors.New("URL host resolves to a non-routable address")
-	ErrInvalidCustomCode = errors.New("custom code must be alphanumeric (3-32 chars: letters, digits, '_' or '-')")
-	ErrReservedCode      = errors.New("custom code is reserved")
-	ErrInvalidTag        = errors.New("tag is empty or exceeds maximum length")
-	ErrTooManyTags       = errors.New("too many tags")
+	ErrInvalidURL          = errors.New("invalid URL")
+	ErrInvalidScheme       = errors.New("URL must use http or https scheme")
+	ErrURLTooLong          = errors.New("URL exceeds maximum length")
+	ErrUserInfo            = errors.New("URL must not contain user credentials")
+	ErrInvalidHost         = errors.New("URL has no resolvable host")
+	ErrPrivateAddress      = errors.New("URL host resolves to a non-routable address")
+	ErrInvalidCustomCode   = errors.New("custom code must be alphanumeric (3-32 chars: letters, digits, '_' or '-')")
+	ErrReservedCode        = errors.New("custom code is reserved")
+	ErrInvalidTag          = errors.New("tag is empty or exceeds maximum length")
+	ErrTooManyTags         = errors.New("too many tags")
+	ErrInvalidDestination  = errors.New("destination has invalid weight or URL")
+	ErrTooManyDestinations = errors.New("too many destinations in routing pool")
+)
+
+// Destination pool limits. Keep weights small so the cumulative sum
+// stays well within int range and the pool stays human-comprehensible —
+// a 90/10 split is a typical A/B and doesn't need 100k-weight precision.
+const (
+	MaxDestinationsPerURL = 10
+	MaxDestinationWeight  = 100
 )
 
 // Tag limits are deliberately tight. Tags are owner-supplied labels with no
@@ -69,6 +81,35 @@ func NormalizeTags(in []string) ([]string, error) {
 	}
 	if len(out) > MaxTagsPerURL {
 		return nil, ErrTooManyTags
+	}
+	return out, nil
+}
+
+// ValidateDestinations runs the full SSRF + deny-list check on every
+// destination in a routing pool and enforces the per-pool limits
+// (count + per-entry weight). Returns the validated slice (a copy so
+// the caller can hand it straight to the store) or the first
+// validation error encountered.
+//
+// nil/empty input → (nil, nil) so callers can pass the optional
+// request field through unchanged: "no pool" is a valid state, not
+// an error.
+func ValidateDestinations(in []models.Destination, deny *DenyList) ([]models.Destination, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	if len(in) > MaxDestinationsPerURL {
+		return nil, ErrTooManyDestinations
+	}
+	out := make([]models.Destination, 0, len(in))
+	for _, d := range in {
+		if d.Weight < 1 || d.Weight > MaxDestinationWeight {
+			return nil, ErrInvalidDestination
+		}
+		if err := ValidateDestinationURL(d.URL, deny); err != nil {
+			return nil, err
+		}
+		out = append(out, models.Destination{URL: d.URL, Weight: d.Weight})
 	}
 	return out, nil
 }

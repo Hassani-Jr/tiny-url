@@ -49,6 +49,20 @@ type URLMapping struct {
 	PreviewImage       string
 	PreviewDescription string
 	PreviewFetchedAt   *time.Time
+	// Destinations is the weighted A/B routing pool. When non-empty,
+	// the redirect handler picks one entry weighted-randomly instead
+	// of using OriginalURL. OriginalURL stays populated for analytics
+	// display + the QR target (the primary destination).
+	Destinations []Destination
+}
+
+// Destination is one entry in a URL's weighted routing pool. Weight
+// is a positive integer in [1, 100]; the redirect handler picks
+// proportionally to weight / total. URLs are validated against the
+// same SSRF + deny-list rules as the primary OriginalURL.
+type Destination struct {
+	URL    string `json:"url"`
+	Weight int    `json:"weight"`
 }
 
 // ShortenRequest represents the request to create a shortened URL
@@ -60,20 +74,26 @@ type ShortenRequest struct {
 	MaxClicks      int64    `json:"max_clicks,omitempty"`      // Optional cap; 0 = unlimited
 	Password       string   `json:"password,omitempty"`        // Optional passphrase; gates redirect
 	WebhookURL     string   `json:"webhook_url,omitempty"`     // Optional click webhook target
+	// Destinations sets up A/B / weighted routing. Each entry is
+	// validated like the primary URL (SSRF, deny-list, scheme).
+	// When set, the redirect handler picks one weighted-randomly per
+	// click instead of going straight to `url`. Up to 10 entries.
+	Destinations []Destination `json:"destinations,omitempty"`
 }
 
 // ShortenResponse represents the response containing the shortened URL
 type ShortenResponse struct {
-	ShortCode     string     `json:"short_code"`
-	ShortURL      string     `json:"short_url"`
-	OriginalURL   string     `json:"original_url"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	AdminToken    string     `json:"admin_token"` // returned once; required to read analytics for this code
-	Tags          []string   `json:"tags,omitempty"`
-	MaxClicks     int64      `json:"max_clicks,omitempty"`
-	HasPassword   bool       `json:"has_password,omitempty"`
-	WebhookURL    string     `json:"webhook_url,omitempty"`
-	WebhookSecret string     `json:"webhook_secret,omitempty"` // returned once when a webhook is configured; HMAC-SHA256 key
+	ShortCode     string        `json:"short_code"`
+	ShortURL      string        `json:"short_url"`
+	OriginalURL   string        `json:"original_url"`
+	ExpiresAt     *time.Time    `json:"expires_at,omitempty"`
+	AdminToken    string        `json:"admin_token"` // returned once; required to read analytics for this code
+	Tags          []string      `json:"tags,omitempty"`
+	MaxClicks     int64         `json:"max_clicks,omitempty"`
+	HasPassword   bool          `json:"has_password,omitempty"`
+	WebhookURL    string        `json:"webhook_url,omitempty"`
+	WebhookSecret string        `json:"webhook_secret,omitempty"` // returned once when a webhook is configured; HMAC-SHA256 key
+	Destinations  []Destination `json:"destinations,omitempty"`
 }
 
 // AnalyticsResponse represents analytics data for a shortened URL.
@@ -102,6 +122,10 @@ type AnalyticsResponse struct {
 	PreviewImage       string     `json:"preview_image,omitempty"`
 	PreviewDescription string     `json:"preview_description,omitempty"`
 	PreviewFetchedAt   *time.Time `json:"preview_fetched_at,omitempty"`
+	// Destinations exposes the routing pool to owners so the dashboard
+	// can render the A/B configuration. Empty for single-destination
+	// URLs (the common case) — clients should fall back to original_url.
+	Destinations []Destination `json:"destinations,omitempty"`
 }
 
 // ErrorResponse represents an error response

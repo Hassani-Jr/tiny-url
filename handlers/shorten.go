@@ -154,6 +154,15 @@ func (h *ShortenHandler) shortenOne(req models.ShortenRequest, apiKeyID int64, r
 		}
 	}
 
+	// Destinations: validate each entry against the same SSRF + deny
+	// rules as the primary URL. The primary OriginalURL stays in its
+	// own column so analytics + QR codes have a stable "this is what
+	// the link is for" anchor; the routing pool is separate.
+	dests, err := services.ValidateDestinations(req.Destinations, h.denyList)
+	if err != nil {
+		return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_destinations", Message: destinationsMessage(err)}
+	}
+
 	var webhookSecret []byte
 	if req.WebhookURL != "" {
 		if err := services.ValidateDestinationURL(req.WebhookURL, h.denyList); err != nil {
@@ -198,6 +207,7 @@ func (h *ShortenHandler) shortenOne(req models.ShortenRequest, apiKeyID int64, r
 		WebhookURL:     req.WebhookURL,
 		WebhookSecret:  webhookSecret,
 		APIKeyID:       apiKeyID,
+		Destinations:   dests,
 	}
 	if err := h.storage.Set(shortCode, urlMapping); err != nil {
 		if errors.Is(err, services.ErrCodeConflict) {
@@ -207,15 +217,16 @@ func (h *ShortenHandler) shortenOne(req models.ShortenRequest, apiKeyID int64, r
 	}
 
 	resp := &models.ShortenResponse{
-		ShortCode:   shortCode,
-		ShortURL:    h.baseURL + "/" + shortCode,
-		OriginalURL: req.URL,
-		ExpiresAt:   expiresAt,
-		AdminToken:  token,
-		Tags:        tags,
-		MaxClicks:   req.MaxClicks,
-		HasPassword: len(pwHash) > 0,
-		WebhookURL:  req.WebhookURL,
+		ShortCode:    shortCode,
+		ShortURL:     h.baseURL + "/" + shortCode,
+		OriginalURL:  req.URL,
+		ExpiresAt:    expiresAt,
+		AdminToken:   token,
+		Tags:         tags,
+		MaxClicks:    req.MaxClicks,
+		HasPassword:  len(pwHash) > 0,
+		WebhookURL:   req.WebhookURL,
+		Destinations: dests,
 	}
 	if len(webhookSecret) > 0 {
 		resp.WebhookSecret = encodeWebhookSecret(webhookSecret)
@@ -289,6 +300,19 @@ func customCodeMessage(err error) string {
 		return "Custom code is reserved and cannot be used"
 	default:
 		return "Invalid custom code"
+	}
+}
+
+func destinationsMessage(err error) string {
+	switch {
+	case errors.Is(err, services.ErrInvalidDestination):
+		return "destination URL or weight is invalid (weight must be 1-100)"
+	case errors.Is(err, services.ErrTooManyDestinations):
+		return "too many destinations (max 10)"
+	default:
+		// Underlying SSRF / deny / scheme errors come up via the URL
+		// validator's ErrPrivateAddress / ErrDeniedHost wrappings.
+		return validationMessage(err)
 	}
 }
 

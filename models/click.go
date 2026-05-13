@@ -21,4 +21,9 @@ type ClickEvent struct {
 	// Country is coarse enough to keep the privacy posture (no city, no
 	// lat/lon, no ASN).
 	Country string `json:"country,omitempty"`
+	// DestinationURL is which destination was served on this click.
+	// Populated only for URLs with a Destinations pool — single-
+	// destination URLs leave this empty (the OriginalURL is the only
+	// possibility, no need to denormalize).
+	DestinationURL string `json:"destination_url,omitempty"`
 }

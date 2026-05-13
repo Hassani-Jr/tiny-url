@@ -136,6 +136,10 @@ type UpdateFields struct {
 	PreviewImage       *string
 	PreviewDescription *string
 	SetPreviewFetched  bool // when true, PreviewFetchedAt is stamped to now
+	// Destinations replaces the entire routing pool. nil = leave
+	// alone; non-nil (even empty) = replace, where an empty slice
+	// reverts the URL to single-destination mode (uses OriginalURL).
+	Destinations *[]models.Destination
 }
 
 // memoryClickCapPerCode bounds the in-memory event log per short code so a
@@ -316,6 +320,10 @@ func (s *MemoryStore) Update(code string, f UpdateFields) error {
 	if f.SetPreviewFetched {
 		now := time.Now()
 		m.PreviewFetchedAt = &now
+	}
+	if f.Destinations != nil {
+		// Copy so the caller's slice can't mutate state outside the lock.
+		m.Destinations = append([]models.Destination(nil), (*f.Destinations)...)
 	}
 	return nil
 }

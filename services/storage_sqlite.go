@@ -88,18 +88,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor_kind, actor_id)
 // Each entry is run as a standalone ALTER TABLE; SQLite forbids multiple
 // ADD COLUMNs in one statement.
 var addedColumns = []string{
-	`ALTER TABLE urls ADD COLUMN tags TEXT`,                  // JSON array; NULL == no tags
-	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,         // 0/NULL == unlimited
-	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,         // NULL == no password
-	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,         // paired with password_hash
-	`ALTER TABLE urls ADD COLUMN webhook_url TEXT`,           // NULL == no webhook
-	`ALTER TABLE urls ADD COLUMN webhook_secret BLOB`,        // HMAC-SHA256 key; paired with webhook_url
-	`ALTER TABLE click_events ADD COLUMN country TEXT`,       // ISO-3166-1 alpha-2; NULL when geoip is off
-	`ALTER TABLE urls ADD COLUMN api_key_id INTEGER`,         // NULL when not bound to an API key
-	`ALTER TABLE urls ADD COLUMN preview_title TEXT`,         // unfurl title
-	`ALTER TABLE urls ADD COLUMN preview_image TEXT`,         // unfurl og:image
-	`ALTER TABLE urls ADD COLUMN preview_description TEXT`,   // unfurl og:description
-	`ALTER TABLE urls ADD COLUMN preview_fetched_at INTEGER`, // NULL == unfurl never attempted
+	`ALTER TABLE urls ADD COLUMN tags TEXT`,                    // JSON array; NULL == no tags
+	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,           // 0/NULL == unlimited
+	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,           // NULL == no password
+	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,           // paired with password_hash
+	`ALTER TABLE urls ADD COLUMN webhook_url TEXT`,             // NULL == no webhook
+	`ALTER TABLE urls ADD COLUMN webhook_secret BLOB`,          // HMAC-SHA256 key; paired with webhook_url
+	`ALTER TABLE click_events ADD COLUMN country TEXT`,         // ISO-3166-1 alpha-2; NULL when geoip is off
+	`ALTER TABLE urls ADD COLUMN api_key_id INTEGER`,           // NULL when not bound to an API key
+	`ALTER TABLE urls ADD COLUMN preview_title TEXT`,           // unfurl title
+	`ALTER TABLE urls ADD COLUMN preview_image TEXT`,           // unfurl og:image
+	`ALTER TABLE urls ADD COLUMN preview_description TEXT`,     // unfurl og:description
+	`ALTER TABLE urls ADD COLUMN preview_fetched_at INTEGER`,   // NULL == unfurl never attempted
+	`ALTER TABLE urls ADD COLUMN destinations TEXT`,            // JSON [{url,weight}] when A/B routing active
+	`ALTER TABLE click_events ADD COLUMN destination_url TEXT`, // which destination this click served
 }
 
 // NewSQLiteStore opens (or creates) a SQLite database at path and applies
@@ -180,14 +182,18 @@ func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	if m.PreviewFetchedAt != nil {
 		previewFetched = m.PreviewFetchedAt.UnixNano()
 	}
+	destsJSON, err := encodeDestinations(m.Destinations)
+	if err != nil {
+		return err
+	}
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at)
-		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at, destinations)
+		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
 		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
 		nullableText(m.WebhookURL), nullableBlob(m.WebhookSecret), nullableInt(m.APIKeyID),
 		nullableText(m.PreviewTitle), nullableText(m.PreviewImage), nullableText(m.PreviewDescription),
-		previewFetched,
+		previewFetched, destsJSON,
 	)
 	if err != nil {
 		return err
@@ -210,6 +216,22 @@ func encodeTags(tags []string) (any, error) {
 		return nil, nil
 	}
 	b, err := json.Marshal(tags)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+// encodeDestinations marshals a routing pool into the destinations
+// TEXT column. Same NULL-on-empty convention as encodeTags so a
+// single-destination URL keeps the column null and the redirect
+// handler's "len(Destinations) == 0" check works without a special-
+// case decode.
+func encodeDestinations(in []models.Destination) (any, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	b, err := json.Marshal(in)
 	if err != nil {
 		return nil, err
 	}
@@ -253,15 +275,16 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		previewImage   sql.NullString
 		previewDesc    sql.NullString
 		previewFetched sql.NullInt64
+		destsJSON      sql.NullString
 	)
 	err := s.db.QueryRow(
 		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
 		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id,
-		        preview_title, preview_image, preview_description, preview_fetched_at
+		        preview_title, preview_image, preview_description, preview_fetched_at, destinations
 		 FROM urls WHERE short_code = ?`, code,
 	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
 		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID,
-		&previewTitle, &previewImage, &previewDesc, &previewFetched)
+		&previewTitle, &previewImage, &previewDesc, &previewFetched, &destsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -287,6 +310,15 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 	if previewFetched.Valid {
 		t := time.Unix(0, previewFetched.Int64)
 		m.PreviewFetchedAt = &t
+	}
+	if destsJSON.Valid && destsJSON.String != "" {
+		// Same resilience as the tags column — corrupt JSON in
+		// destinations falls back to "no pool" rather than failing
+		// the redirect path.
+		if err := json.Unmarshal([]byte(destsJSON.String), &m.Destinations); err != nil {
+			slog.Warn("sqlite: malformed destinations JSON", "code", code, "err", err)
+			m.Destinations = nil
+		}
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -378,9 +410,9 @@ func (s *SQLiteStore) RecordClick(code string, ev models.ClickEvent) error {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class, country)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass), nullableText(ev.Country),
+		`INSERT INTO click_events (short_code, clicked_at, ip_hash, referer, ua_class, country, destination_url)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		code, ev.At.UnixNano(), nullableText(ev.IPHash), nullableText(ev.Referer), nullableText(ev.UAClass), nullableText(ev.Country), nullableText(ev.DestinationURL),
 	); err != nil {
 		return err
 	}
@@ -397,7 +429,7 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 		limit = 50
 	}
 	rows, err := s.db.Query(
-		`SELECT clicked_at, ip_hash, referer, ua_class, country
+		`SELECT clicked_at, ip_hash, referer, ua_class, country, destination_url
 		 FROM click_events WHERE short_code = ?
 		 ORDER BY clicked_at DESC LIMIT ?`,
 		code, limit,
@@ -409,18 +441,19 @@ func (s *SQLiteStore) RecentClicks(code string, limit int) ([]models.ClickEvent,
 	out := make([]models.ClickEvent, 0)
 	for rows.Next() {
 		var (
-			ts                                int64
-			ipHash, referer, uaClass, country sql.NullString
+			ts                                      int64
+			ipHash, referer, uaClass, country, dest sql.NullString
 		)
-		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass, &country); err != nil {
+		if err := rows.Scan(&ts, &ipHash, &referer, &uaClass, &country, &dest); err != nil {
 			return nil, err
 		}
 		out = append(out, models.ClickEvent{
-			At:      time.Unix(0, ts),
-			IPHash:  ipHash.String,
-			Referer: referer.String,
-			UAClass: uaClass.String,
-			Country: country.String,
+			At:             time.Unix(0, ts),
+			IPHash:         ipHash.String,
+			Referer:        referer.String,
+			UAClass:        uaClass.String,
+			Country:        country.String,
+			DestinationURL: dest.String,
 		})
 	}
 	return out, rows.Err()
@@ -515,6 +548,14 @@ func (s *SQLiteStore) Update(code string, f UpdateFields) error {
 	if f.SetPreviewFetched {
 		sets = append(sets, "preview_fetched_at = ?")
 		args = append(args, time.Now().UnixNano())
+	}
+	if f.Destinations != nil {
+		enc, err := encodeDestinations(*f.Destinations)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, "destinations = ?")
+		args = append(args, enc)
 	}
 
 	if len(sets) == 0 {
