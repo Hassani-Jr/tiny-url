@@ -15,6 +15,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // WebhookEvent is the per-click work item enqueued for asynchronous
@@ -83,6 +88,17 @@ func NewWebhookDispatcher(workers, queueSize int, timeout time.Duration) *Webhoo
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	// otelhttp.Transport wraps the underlying RoundTripper so each
+	// outbound webhook POST gets a child span AND has the W3C
+	// traceparent header injected automatically. The receiver gets a
+	// span for the incoming request linked back to the click that
+	// fired the webhook — useful when debugging "did my webhook
+	// actually fire" across the network boundary.
+	baseTransport := &http.Transport{
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true,
+	}
 	d := &WebhookDispatcher{
 		queue:         make(chan WebhookEvent, queueSize),
 		hostValidator: ValidateHostAtRuntime,
@@ -94,14 +110,7 @@ func NewWebhookDispatcher(workers, queueSize int, timeout time.Duration) *Webhoo
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
-			Transport: &http.Transport{
-				// Conservative defaults — webhooks are bursty per-URL but the
-				// overall pool is small, so we don't need an unbounded number
-				// of idle connections per host.
-				MaxIdleConnsPerHost: 4,
-				IdleConnTimeout:     30 * time.Second,
-				DisableCompression:  true,
-			},
+			Transport: otelhttp.NewTransport(baseTransport),
 		},
 	}
 	for i := 0; i < workers; i++ {
@@ -152,22 +161,45 @@ func (d *WebhookDispatcher) worker() {
 	}
 }
 
+// webhookTracer is the package-scope tracer for delivery spans. The
+// global TracerProvider is set by services.InitTracing on startup —
+// when tracing is disabled this becomes the no-op tracer and the
+// spans are free.
+var webhookTracer = otel.Tracer("tiny-url/webhook")
+
 // deliver runs the actual HTTP POST with retry. Errors are logged but
 // otherwise swallowed — the click itself has already been recorded by
 // the time we get here, so a failed webhook is a downstream notification
 // issue, not a data-loss issue.
 func (d *WebhookDispatcher) deliver(ev WebhookEvent) {
+	// Top-level span wraps the full delivery including the runtime
+	// SSRF re-check and the retry loop, so an operator looking at a
+	// failed webhook can see exactly how many attempts the dispatcher
+	// made and where time went between them. The span starts as a
+	// root because the click that triggered this already finished
+	// (the redirect response went out before Enqueue), so there's no
+	// inbound parent context to inherit.
+	ctx, span := webhookTracer.Start(context.Background(), "webhook.deliver")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("tinyurl.code", ev.Code),
+		attribute.Int("tinyurl.payload_bytes", len(ev.Payload)),
+	)
 	// Runtime SSRF check. The host's DNS could have been flipped to
 	// 127.0.0.1 after the webhook was configured; re-resolving here
 	// closes the rebinding window before we POST.
 	parsed, err := url.Parse(ev.URL)
 	if err != nil {
 		d.failed.Add(1)
+		span.SetStatus(codes.Error, "bad URL")
+		span.RecordError(err)
 		slog.Warn("webhook: bad URL", "code", ev.Code, "err", err)
 		return
 	}
 	if err := d.hostValidator(parsed.Hostname()); err != nil {
 		d.failed.Add(1)
+		span.SetStatus(codes.Error, "ssrf check failed")
+		span.RecordError(err)
 		slog.Warn("webhook: SSRF re-check failed", "code", ev.Code, "host", parsed.Hostname(), "err", err)
 		return
 	}
@@ -180,19 +212,25 @@ func (d *WebhookDispatcher) deliver(ev WebhookEvent) {
 		if attempt > 0 {
 			time.Sleep(backoff[attempt])
 		}
-		retry, err := d.attempt(ev, sig)
+		retry, err := d.attempt(ctx, ev, sig)
 		if err == nil {
 			d.sent.Add(1)
+			span.SetAttributes(attribute.Int("tinyurl.attempts", attempt+1))
 			return
 		}
 		if !retry {
 			d.failed.Add(1)
+			span.SetStatus(codes.Error, "non-retryable failure")
+			span.RecordError(err)
+			span.SetAttributes(attribute.Int("tinyurl.attempts", attempt+1))
 			slog.Warn("webhook: gave up", "code", ev.Code, "attempt", attempt+1, "err", err)
 			return
 		}
 		slog.Debug("webhook: retrying", "code", ev.Code, "attempt", attempt+1, "err", err)
 	}
 	d.failed.Add(1)
+	span.SetStatus(codes.Error, "retries exhausted")
+	span.SetAttributes(attribute.Int("tinyurl.attempts", maxAttempts))
 	slog.Warn("webhook: exhausted retries", "code", ev.Code)
 }
 
@@ -200,8 +238,12 @@ func (d *WebhookDispatcher) deliver(ev WebhookEvent) {
 // the failure was transient (5xx, timeout, connection error) and the
 // caller should back off and try again; retry=false means a terminal
 // non-retryable response (2xx success → err is nil; 4xx → err non-nil).
-func (d *WebhookDispatcher) attempt(ev WebhookEvent, sig []byte) (retry bool, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), d.client.Timeout)
+//
+// The parent context carries the active webhook.deliver span so the
+// outbound HTTP span created by otelhttp.Transport links back to it,
+// giving an operator a single trace covering the whole retry chain.
+func (d *WebhookDispatcher) attempt(parent context.Context, ev WebhookEvent, sig []byte) (retry bool, err error) {
+	ctx, cancel := context.WithTimeout(parent, d.client.Timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ev.URL, bytes.NewReader(ev.Payload))
 	if err != nil {

@@ -202,7 +202,7 @@ func (h *RedirectHandler) passwordOK(w http.ResponseWriter, r *http.Request, m *
 			renderPasswordForm(w, http.StatusBadRequest, m.ID, hintEmpty)
 			return false
 		}
-		if !verifyPassword(r.PostFormValue("password"), m.PasswordHash, m.PasswordSalt) {
+		if !verifyPassword(r.Context(), r.PostFormValue("password"), m.PasswordHash, m.PasswordSalt) {
 			renderPasswordForm(w, http.StatusUnauthorized, m.ID, hintWrong)
 			return false
 		}

@@ -1,11 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+
+	"go.opentelemetry.io/otel"
 )
+
+// passwordTracer scopes spans created by the password-verify path.
+// Resolved once at package init; the global TracerProvider is a no-op
+// when tracing isn't configured so this is free off the hot path.
+var passwordTracer = otel.Tracer("tiny-url/password")
 
 // passwordIterations is the PBKDF2 iteration count used to derive a key
 // from a user-supplied short-URL passphrase. 200_000 with SHA-256 is in the
@@ -46,7 +54,14 @@ func hashPassword(password string) ([]byte, []byte, error) {
 // through PBKDF2-SHA256 with the stored salt. Constant-time comparison
 // prevents timing oracles even though the per-hash cost (~50ms) already
 // largely drowns out the per-byte compare difference.
-func verifyPassword(password string, hash, salt []byte) bool {
+//
+// Wrapped in a trace span so operators can see when the redirect path
+// is being slowed by failed-password attempts — the ~50 ms PBKDF2 cost
+// is the dominant per-redirect work when this path fires, so making
+// it observable is worth the no-op span overhead.
+func verifyPassword(ctx context.Context, password string, hash, salt []byte) bool {
+	_, span := passwordTracer.Start(ctx, "password.verify")
+	defer span.End()
 	if len(hash) == 0 || len(salt) == 0 {
 		return false
 	}

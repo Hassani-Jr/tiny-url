@@ -49,6 +49,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing init goes BEFORE the store so the inbound HTTP wrapper
+	// installed in buildHandler picks up the global TracerProvider
+	// without a race. shutdownTracing is deferred to the end of main()
+	// so in-flight spans get flushed even on a panic recovery upstack.
+	shutdownTracing, err := services.InitTracing(ctx, "tiny-url", or(buildVersion, "dev"))
+	if err != nil {
+		fatalf("tracing init: %v", err)
+	}
+	defer func() {
+		// Use a fresh context: the parent has already been cancelled
+		// by SIGTERM by the time we reach this deferred call, and the
+		// exporter's flush needs an alive context with a small budget.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			slog.Error("tracing shutdown", "err", err)
+		}
+	}()
+
 	store, err := openStore(cfg)
 	if err != nil {
 		fatalf("store init: %v", err)

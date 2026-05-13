@@ -7,6 +7,8 @@ import (
 
 	"log/slog"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"tiny-url/config"
 	"tiny-url/handlers"
 	"tiny-url/middleware"
@@ -158,7 +160,12 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	// the recover branch sets — without that, a panicked handler would be
 	// counted as 2xx and logged with status=200. SecurityHeaders sits inside
 	// Recover so the standard headers still ship on the recovered 500.
-	return middleware.RequestID(
+	// otelhttp goes OUTERMOST so the inbound span captures the full
+	// request, including the time spent in our own middleware stack
+	// (logger, metrics, recover, security headers). The span name is
+	// the matched route pattern when available, which the otelhttp
+	// option below extracts from http.ServeMux's path matching.
+	core := middleware.RequestID(
 		middleware.Logger(
 			middleware.Metrics(
 				middleware.Recover(
@@ -166,5 +173,14 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 				),
 			),
 		),
+	)
+	return otelhttp.NewHandler(core, "tiny-url",
+		// Span names default to the HTTP method; use the request path
+		// pattern instead so the backend groups by route rather than
+		// drowning in one giant "GET" span. This matches the same
+		// route-label scheme our Prometheus exposition already uses.
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + r.URL.Path
+		}),
 	), nil
 }

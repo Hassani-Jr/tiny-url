@@ -488,7 +488,8 @@ All settings are loaded from environment variables with sensible defaults. No co
 | `CLICK_IP_SALT` | (random) | Salt mixed into IP hashes. Empty → fresh random per-process salt (unique counts reset on restart). Set to a long random string for cross-deploy stability. |
 | `CLICK_RETENTION_DAYS` | `90` | The SQLite cleanup goroutine prunes click events older than this many days. Set to `0` to disable pruning (events kept forever — only do this on low-volume deployments). The memory backend caps to the most recent 1000 events per code regardless of this setting. |
 | `SHUTDOWN_DRAIN_SECS` | `5` | Sleep window between SIGTERM and `server.Shutdown` so load balancers and service-mesh sidecars can finish propagating the deregistration. Set to `0` to skip the drain. |
-| `METRICS_TOKEN` | (none) | When set, `GET /metrics` requires `Authorization: Bearer <token>`. Empty (the default) leaves the endpoint open — fine when it's firewalled or only reachable on a private network; set this when scrapers cross an untrusted boundary. |
+| `METRICS_TOKEN` | (none) | When set, `GET /metrics` and `GET /api/audit` require `Authorization: Bearer <token>`. Empty (the default) leaves both endpoints open — fine when they're firewalled or only reachable on a private network; set this when scrapers cross an untrusted boundary. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (none) | When set, traces are exported via OTLP/HTTP to this endpoint (e.g. `http://otel-collector:4318`). Reads all standard `OTEL_*` env vars — `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_HEADERS`, etc. Empty (the default) disables the exporter; W3C trace-context propagation still works inbound/outbound so child services see the same trace ID. |
 
 ### Example: Production Deployment
 
