@@ -34,30 +34,30 @@ func NewShortenHandler(storage services.Store, baseURL string, maxExpirationMinu
 	}
 }
 
-// ServeHTTP handles the HTTP request for shortening a URL
+// itemError is the typed error returned by shortenOne so the HTTP
+// layer can map it to the right status code. Carries a stable `code`
+// string for machine readers and a human-readable message — useful
+// for the bulk endpoint where individual items can fail without
+// failing the whole request.
+type itemError struct {
+	Status  int    `json:"-"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *itemError) Error() string { return e.Message }
+
+// ServeHTTP handles a single POST /api/shorten request. Thin wrapper
+// over shortenOne — same validation, same audit, same error shapes,
+// just one item.
 func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Only POST method is allowed")
 		return
 	}
-
-	// If the caller authenticates with an API key, the resulting URL is
-	// bound to that key (api_key_id). Unauthenticated callers continue
-	// to use the per-URL admin token model — both paths return an
-	// admin_token, so existing clients don't break.
-	var apiKeyID int64
-	if _, hash := extractBearer(r); hash != nil {
-		if key, err := h.storage.LookupAPIKey(hash); err == nil {
-			apiKeyID = key.ID
-		}
-		// A bearer that doesn't match any API key is NOT an error — we
-		// fall through to the unauthenticated flow. This matters for the
-		// dashboard, which may have a stale key in localStorage; the
-		// shorten still works, the URL just isn't auto-claimed.
-	}
+	apiKeyID := h.detectAPIKey(r)
 
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
-
 	var req models.ShortenRequest
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -66,30 +66,57 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate cheap things first (regex, in-memory lookup) before doing DNS
-	// resolution for SSRF — both saves work on bad requests and lets the
-	// custom-alias collision error surface even when the URL is invalid.
+	resp, ierr := h.shortenOne(req, apiKeyID, requestIDFromContext(r))
+	if ierr != nil {
+		writeError(w, ierr.Status, ierr.Message)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// detectAPIKey resolves the request's bearer token to an API key ID
+// (if any). A bearer that doesn't match any key is NOT an error — it
+// silently falls through to the unauthenticated flow so a stale key
+// in a client's localStorage doesn't break URL creation.
+func (h *ShortenHandler) detectAPIKey(r *http.Request) int64 {
+	_, hash := extractBearer(r)
+	if hash == nil {
+		return 0
+	}
+	if key, err := h.storage.LookupAPIKey(hash); err == nil {
+		return key.ID
+	}
+	return 0
+}
+
+// shortenOne runs the full single-URL pipeline: validation → generate
+// codes/tokens/secrets → persist → audit. Returns either a populated
+// response or a typed item error. The bulk endpoint calls this in a
+// loop, letting one bad item fail without failing the whole request.
+func (h *ShortenHandler) shortenOne(req models.ShortenRequest, apiKeyID int64, reqID string) (*models.ShortenResponse, *itemError) {
+	// Validate cheap things first (regex, in-memory lookup) before
+	// doing DNS resolution for SSRF — saves work on bad requests and
+	// lets the custom-alias collision error surface even when the URL
+	// is invalid.
 	var shortCode string
 	if req.CustomCode != "" {
 		if err := services.ValidateCustomCode(req.CustomCode); err != nil {
-			writeError(w, http.StatusBadRequest, customCodeMessage(err))
-			return
+			return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_custom_code", Message: customCodeMessage(err)}
 		}
 		if h.storage.Exists(req.CustomCode) {
-			writeError(w, http.StatusConflict, "custom code is already in use")
-			return
+			return nil, &itemError{Status: http.StatusConflict, Code: "code_conflict", Message: "custom code is already in use"}
 		}
 		shortCode = req.CustomCode
 	}
 
 	if err := services.ValidateDestinationURL(req.URL, h.denyList); err != nil {
-		writeError(w, http.StatusBadRequest, validationMessage(err))
-		return
+		return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_url", Message: validationMessage(err)}
 	}
 
 	if req.ExpirationMins < 0 {
-		writeError(w, http.StatusBadRequest, "expiration_mins must be non-negative")
-		return
+		return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_expiration", Message: "expiration_mins must be non-negative"}
 	}
 	if req.ExpirationMins > h.maxExpirationMinutes {
 		req.ExpirationMins = h.maxExpirationMinutes
@@ -97,13 +124,11 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	tags, err := services.NormalizeTags(req.Tags)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, tagsMessage(err))
-		return
+		return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_tags", Message: tagsMessage(err)}
 	}
 
 	if req.MaxClicks < 0 {
-		writeError(w, http.StatusBadRequest, "max_clicks must be non-negative")
-		return
+		return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_max_clicks", Message: "max_clicks must be non-negative"}
 	}
 
 	var (
@@ -111,49 +136,37 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		pwSalt []byte
 	)
 	if req.Password != "" {
-		// Cap the password length so an attacker can't make us spend CPU on
-		// a multi-megabyte password before the body-size limit catches up.
-		// 256 bytes is well past any human-typeable passphrase.
 		if len(req.Password) > 256 {
-			writeError(w, http.StatusBadRequest, "password too long")
-			return
+			return nil, &itemError{Status: http.StatusBadRequest, Code: "password_too_long", Message: "password too long"}
 		}
 		pwHash, pwSalt, err = hashPassword(req.Password)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to hash password")
-			return
+			return nil, &itemError{Status: http.StatusInternalServerError, Code: "internal", Message: "Failed to hash password"}
 		}
 	}
 
 	var webhookSecret []byte
 	if req.WebhookURL != "" {
-		// Same SSRF + deny rules as the destination URL. A webhook target
-		// pointing at 127.0.0.1 would let an attacker pivot through our
-		// click-driven HTTP client to internal services.
 		if err := services.ValidateDestinationURL(req.WebhookURL, h.denyList); err != nil {
-			writeError(w, http.StatusBadRequest, "webhook_url: "+validationMessage(err))
-			return
+			return nil, &itemError{Status: http.StatusBadRequest, Code: "invalid_webhook_url", Message: "webhook_url: " + validationMessage(err)}
 		}
 		webhookSecret, err = generateWebhookSecret()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to generate webhook secret")
-			return
+			return nil, &itemError{Status: http.StatusInternalServerError, Code: "internal", Message: "Failed to generate webhook secret"}
 		}
 	}
 
 	if shortCode == "" {
 		c, err := services.GenerateShortCode(h.storage)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to generate short code")
-			return
+			return nil, &itemError{Status: http.StatusInternalServerError, Code: "internal", Message: "Failed to generate short code"}
 		}
 		shortCode = c
 	}
 
 	token, hash, err := generateOwnerToken()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to generate owner token")
-		return
+		return nil, &itemError{Status: http.StatusInternalServerError, Code: "internal", Message: "Failed to generate owner token"}
 	}
 
 	var expiresAt *time.Time
@@ -178,19 +191,13 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		APIKeyID:       apiKeyID,
 	}
 	if err := h.storage.Set(shortCode, urlMapping); err != nil {
-		// Defense-in-depth for the Exists/Set TOCTOU race: another writer
-		// may have claimed the same code between our Exists check and this
-		// Set. The store now reports ErrCodeConflict instead of silently
-		// overwriting, and we surface it as 409 Conflict.
 		if errors.Is(err, services.ErrCodeConflict) {
-			writeError(w, http.StatusConflict, "custom code is already in use")
-			return
+			return nil, &itemError{Status: http.StatusConflict, Code: "code_conflict", Message: "custom code is already in use"}
 		}
-		writeError(w, http.StatusInternalServerError, "Failed to store URL")
-		return
+		return nil, &itemError{Status: http.StatusInternalServerError, Code: "internal", Message: "Failed to store URL"}
 	}
 
-	response := models.ShortenResponse{
+	resp := &models.ShortenResponse{
 		ShortCode:   shortCode,
 		ShortURL:    h.baseURL + "/" + shortCode,
 		OriginalURL: req.URL,
@@ -202,15 +209,9 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WebhookURL:  req.WebhookURL,
 	}
 	if len(webhookSecret) > 0 {
-		// Returned ONCE — same contract as admin_token. Owner is
-		// expected to save it; rotation re-issues with a new value.
-		response.WebhookSecret = encodeWebhookSecret(webhookSecret)
+		resp.WebhookSecret = encodeWebhookSecret(webhookSecret)
 	}
 
-	// Audit: which credential created this URL? Anon when no bearer
-	// was present; the API key otherwise. There's no admin-token case
-	// at create time since the admin token doesn't exist until we
-	// generate it above.
 	actorKind, actorID := models.AuditActorAnon, ""
 	if apiKeyID > 0 {
 		actorKind, actorID = models.AuditActorAPIKey, fmt.Sprintf("%d", apiKeyID)
@@ -221,12 +222,10 @@ func (h *ShortenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Action:     models.AuditActionURLCreate,
 		TargetKind: "url",
 		TargetID:   shortCode,
-		RequestID:  requestIDFromContext(r),
+		RequestID:  reqID,
 	})
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(response)
+	return resp, nil
 }
 
 // generateOwnerToken returns a high-entropy bearer token (raw, returned once

@@ -100,6 +100,64 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
+  /api/shorten/bulk:
+    post:
+      tags: [URLs]
+      summary: Create many short URLs in one request
+      description: |
+        Accepts an array of `ShortenRequest` items and processes each
+        independently — a bad URL or custom-code conflict fails its own
+        item without rolling back successful neighbours. Designed for
+        migrations from another shortener; capped at 50 items per
+        request and a 64KB body.
+
+        Authentication mirrors `POST /api/shorten`: an API key bearer
+        binds every created URL to that key, unauthenticated calls
+        return per-URL admin tokens as before.
+
+        Always returns 200 OK with per-item results — the response
+        carries `created` / `failed` counts plus an `items` array.
+      parameters:
+        - $ref: '#/components/parameters/XRequestedWith'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items: { $ref: '#/components/schemas/ShortenRequest' }
+      responses:
+        '200':
+          description: Per-item results (mixed success/failure expected for migrations)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer }
+                  failed:  { type: integer }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index:  { type: integer }
+                        result: { $ref: '#/components/schemas/ShortenResponse' }
+                        error:
+                          type: object
+                          properties:
+                            code:    { type: string, example: 'invalid_url' }
+                            message: { type: string }
+        '400': { description: Empty items array, oversize body, or item count over the cap }
+        '403': { description: Missing X-Requested-With header }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   /api/url/{code}:
     parameters:
       - $ref: '#/components/parameters/Code'

@@ -57,6 +57,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	}
 
 	shortenHandler := handlers.NewShortenHandler(store, cfg.BaseURL, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
+	bulkShortenHandler := handlers.NewBulkShortenHandler(shortenHandler, 50)
 	redirectHandler := handlers.NewRedirectHandler(store, handlers.RedirectConfig{
 		DenyList:   denyList,
 		TrustProxy: cfg.TrustProxy,
@@ -93,6 +94,12 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	appMux := http.NewServeMux()
 	appMux.Handle("POST /api/shorten",
 		writeLimiter.Middleware(middleware.RequireXRequestedWith(shortenHandler)))
+	// Bulk shorten shares the write limiter (one bulk = one quota tick)
+	// + XHR-header CSRF, and a smaller per-bucket budget would defeat
+	// the point of bulk. Per-item rate limiting happens implicitly:
+	// the body cap + 50-item cap bound each request's CPU spend.
+	appMux.Handle("POST /api/shorten/bulk",
+		writeLimiter.Middleware(middleware.RequireXRequestedWith(bulkShortenHandler)))
 	appMux.Handle("DELETE /api/url/{code}",
 		writeLimiter.Middleware(deleteHandler))
 	appMux.Handle("PATCH /api/url/{code}",
