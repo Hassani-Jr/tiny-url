@@ -39,6 +39,16 @@ type URLMapping struct {
 	// Zero means "not associated with any API key"; the per-URL admin
 	// token is the only credential.
 	APIKeyID int64
+	// Preview holds the unfurl metadata fetched asynchronously after
+	// creation. Empty fields mean either "unfurl is disabled" or "the
+	// fetch failed / returned nothing useful" — the dashboard treats
+	// the empty case the same way and just hides the preview card.
+	// PreviewFetchedAt is the only required signal of "we attempted
+	// a fetch"; it stays nil for URLs created before unfurl shipped.
+	PreviewTitle       string
+	PreviewImage       string
+	PreviewDescription string
+	PreviewFetchedAt   *time.Time
 }
 
 // ShortenRequest represents the request to create a shortened URL
@@ -83,6 +93,15 @@ type AnalyticsResponse struct {
 	// configured. The secret was shown ONCE at create/rotate time and is
 	// never returned again; lost secrets require a webhook rotation.
 	WebhookURL string `json:"webhook_url,omitempty"`
+	// Preview metadata fetched asynchronously after creation. Empty
+	// fields are normal — most URLs have at most a title and image,
+	// and the fields stay empty when unfurl is disabled or the fetch
+	// failed. Clients should treat `preview_fetched_at == null` as
+	// "not yet attempted".
+	PreviewTitle       string     `json:"preview_title,omitempty"`
+	PreviewImage       string     `json:"preview_image,omitempty"`
+	PreviewDescription string     `json:"preview_description,omitempty"`
+	PreviewFetchedAt   *time.Time `json:"preview_fetched_at,omitempty"`
 }
 
 // ErrorResponse represents an error response

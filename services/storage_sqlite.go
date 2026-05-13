@@ -88,14 +88,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_events(actor_kind, actor_id)
 // Each entry is run as a standalone ALTER TABLE; SQLite forbids multiple
 // ADD COLUMNs in one statement.
 var addedColumns = []string{
-	`ALTER TABLE urls ADD COLUMN tags TEXT`,            // JSON array; NULL == no tags
-	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,   // 0/NULL == unlimited
-	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,   // NULL == no password
-	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,   // paired with password_hash
-	`ALTER TABLE urls ADD COLUMN webhook_url TEXT`,     // NULL == no webhook
-	`ALTER TABLE urls ADD COLUMN webhook_secret BLOB`,  // HMAC-SHA256 key; paired with webhook_url
-	`ALTER TABLE click_events ADD COLUMN country TEXT`, // ISO-3166-1 alpha-2; NULL when geoip is off
-	`ALTER TABLE urls ADD COLUMN api_key_id INTEGER`,   // NULL when not bound to an API key
+	`ALTER TABLE urls ADD COLUMN tags TEXT`,                  // JSON array; NULL == no tags
+	`ALTER TABLE urls ADD COLUMN max_clicks INTEGER`,         // 0/NULL == unlimited
+	`ALTER TABLE urls ADD COLUMN password_hash BLOB`,         // NULL == no password
+	`ALTER TABLE urls ADD COLUMN password_salt BLOB`,         // paired with password_hash
+	`ALTER TABLE urls ADD COLUMN webhook_url TEXT`,           // NULL == no webhook
+	`ALTER TABLE urls ADD COLUMN webhook_secret BLOB`,        // HMAC-SHA256 key; paired with webhook_url
+	`ALTER TABLE click_events ADD COLUMN country TEXT`,       // ISO-3166-1 alpha-2; NULL when geoip is off
+	`ALTER TABLE urls ADD COLUMN api_key_id INTEGER`,         // NULL when not bound to an API key
+	`ALTER TABLE urls ADD COLUMN preview_title TEXT`,         // unfurl title
+	`ALTER TABLE urls ADD COLUMN preview_image TEXT`,         // unfurl og:image
+	`ALTER TABLE urls ADD COLUMN preview_description TEXT`,   // unfurl og:description
+	`ALTER TABLE urls ADD COLUMN preview_fetched_at INTEGER`, // NULL == unfurl never attempted
 }
 
 // NewSQLiteStore opens (or creates) a SQLite database at path and applies
@@ -172,12 +176,18 @@ func (s *SQLiteStore) Set(code string, m *models.URLMapping) error {
 	// the shorten handler can return 409 even when the prior Exists check
 	// passed (the TOCTOU race window between Exists and Set). This is the
 	// non-upsert contract described on MemoryStore.Set.
+	var previewFetched any
+	if m.PreviewFetchedAt != nil {
+		previewFetched = m.PreviewFetchedAt.UnixNano()
+	}
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id)
-		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at)
+		 VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
 		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
 		nullableText(m.WebhookURL), nullableBlob(m.WebhookSecret), nullableInt(m.APIKeyID),
+		nullableText(m.PreviewTitle), nullableText(m.PreviewImage), nullableText(m.PreviewDescription),
+		previewFetched,
 	)
 	if err != nil {
 		return err
@@ -239,13 +249,19 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 		webhookURL     sql.NullString
 		webhookSecret  []byte
 		apiKeyID       sql.NullInt64
+		previewTitle   sql.NullString
+		previewImage   sql.NullString
+		previewDesc    sql.NullString
+		previewFetched sql.NullInt64
 	)
 	err := s.db.QueryRow(
 		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
-		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id
+		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id,
+		        preview_title, preview_image, preview_description, preview_fetched_at
 		 FROM urls WHERE short_code = ?`, code,
 	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
-		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID)
+		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID,
+		&previewTitle, &previewImage, &previewDesc, &previewFetched)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -254,16 +270,23 @@ func (s *SQLiteStore) Get(code string) (*models.URLMapping, error) {
 	}
 
 	m := &models.URLMapping{
-		ID:             code,
-		OriginalURL:    originalURL,
-		CreatedAt:      time.Unix(0, createdAt),
-		ClickCount:     clickCount,
-		OwnerTokenHash: ownerTokenHash,
-		PasswordHash:   passwordHash,
-		PasswordSalt:   passwordSalt,
-		WebhookURL:     webhookURL.String,
-		WebhookSecret:  webhookSecret,
-		APIKeyID:       apiKeyID.Int64,
+		ID:                 code,
+		OriginalURL:        originalURL,
+		CreatedAt:          time.Unix(0, createdAt),
+		ClickCount:         clickCount,
+		OwnerTokenHash:     ownerTokenHash,
+		PasswordHash:       passwordHash,
+		PasswordSalt:       passwordSalt,
+		WebhookURL:         webhookURL.String,
+		WebhookSecret:      webhookSecret,
+		APIKeyID:           apiKeyID.Int64,
+		PreviewTitle:       previewTitle.String,
+		PreviewImage:       previewImage.String,
+		PreviewDescription: previewDesc.String,
+	}
+	if previewFetched.Valid {
+		t := time.Unix(0, previewFetched.Int64)
+		m.PreviewFetchedAt = &t
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -476,6 +499,22 @@ func (s *SQLiteStore) Update(code string, f UpdateFields) error {
 	if f.APIKeyID != nil {
 		sets = append(sets, "api_key_id = ?")
 		args = append(args, nullableInt(*f.APIKeyID))
+	}
+	if f.PreviewTitle != nil {
+		sets = append(sets, "preview_title = ?")
+		args = append(args, nullableText(*f.PreviewTitle))
+	}
+	if f.PreviewImage != nil {
+		sets = append(sets, "preview_image = ?")
+		args = append(args, nullableText(*f.PreviewImage))
+	}
+	if f.PreviewDescription != nil {
+		sets = append(sets, "preview_description = ?")
+		args = append(args, nullableText(*f.PreviewDescription))
+	}
+	if f.SetPreviewFetched {
+		sets = append(sets, "preview_fetched_at = ?")
+		args = append(args, time.Now().UnixNano())
 	}
 
 	if len(sets) == 0 {

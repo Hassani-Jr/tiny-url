@@ -44,11 +44,22 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	webhookDispatcher := services.NewWebhookDispatcher(
 		cfg.WebhookWorkers, cfg.WebhookQueueSize, cfg.WebhookTimeout,
 	)
+	// Unfurler is opt-in via UNFURL_ENABLED. When off we still wire a
+	// zero-value pointer so handler code doesn't need a nil check on
+	// every call — Enqueue on a stopped Unfurler is a no-op.
+	var unfurler *services.Unfurler
+	if cfg.UnfurlEnabled {
+		unfurler = services.NewUnfurler(store, cfg.UnfurlWorkers, cfg.UnfurlQueueSize, cfg.UnfurlTimeout)
+		slog.Info("unfurl enabled", "workers", cfg.UnfurlWorkers, "queue", cfg.UnfurlQueueSize)
+	}
 	// Tied to the request-handling lifecycle: stop accepting deliveries
 	// and drain the queue once the parent context (SIGTERM) fires.
 	go func() {
 		<-ctx.Done()
 		webhookDispatcher.Close()
+		if unfurler != nil {
+			unfurler.Close()
+		}
 	}()
 
 	staticAssets, err := handlers.NewStaticAssets(staticDirFS())
@@ -57,6 +68,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	}
 
 	shortenHandler := handlers.NewShortenHandler(store, cfg.BaseURL, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
+	shortenHandler.SetUnfurler(unfurler)
 	bulkShortenHandler := handlers.NewBulkShortenHandler(shortenHandler, 50)
 	redirectHandler := handlers.NewRedirectHandler(store, handlers.RedirectConfig{
 		DenyList:   denyList,

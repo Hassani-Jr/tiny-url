@@ -20,6 +20,15 @@ type ShortenHandler struct {
 	maxExpirationMinutes int
 	maxBodyBytes         int64
 	denyList             *services.DenyList // may be nil
+	unfurler             *services.Unfurler // may be nil — feature opt-in
+}
+
+// SetUnfurler injects the async preview-fetch dispatcher. nil disables
+// the feature (the default); main.go wires a real instance when
+// UNFURL_ENABLED is set. Kept as a separate setter instead of a
+// constructor arg so existing test call sites don't all need updating.
+func (h *ShortenHandler) SetUnfurler(u *services.Unfurler) {
+	h.unfurler = u
 }
 
 // NewShortenHandler creates a new ShortenHandler. denyList may be nil when
@@ -224,6 +233,14 @@ func (h *ShortenHandler) shortenOne(req models.ShortenRequest, apiKeyID int64, r
 		TargetID:   shortCode,
 		RequestID:  reqID,
 	})
+
+	// Fire-and-forget unfurl. The dashboard polls analytics on the
+	// next refresh and picks up the preview fields when they land —
+	// no need for a synchronous fetch on the create path. nil
+	// unfurler (the default) skips this entirely.
+	if h.unfurler != nil {
+		h.unfurler.Enqueue(services.UnfurlJob{Code: shortCode, URL: req.URL})
+	}
 
 	return resp, nil
 }

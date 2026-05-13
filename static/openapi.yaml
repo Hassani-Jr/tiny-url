@@ -934,6 +934,10 @@ components:
         max_clicks:    { type: integer }
         has_password:  { type: boolean }
         webhook_url:   { type: string, format: uri }
+        preview_title:        { type: string, description: 'Page <title> or og:title fetched at create time. Empty when unfurl is disabled or the fetch returned no useful metadata.' }
+        preview_image:        { type: string, format: uri, description: 'og:image / twitter:image URL.' }
+        preview_description:  { type: string, description: 'og:description / meta description, truncated to 512 chars.' }
+        preview_fetched_at:   { type: string, format: date-time, nullable: true, description: 'When the unfurl was attempted (success OR failure). Null = never attempted.' }
 
     ClicksResponse:
       type: object

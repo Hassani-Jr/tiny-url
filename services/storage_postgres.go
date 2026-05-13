@@ -102,6 +102,10 @@ var postgresMigrations = []string{
 	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS webhook_secret BYTEA`,
 	`ALTER TABLE click_events ADD COLUMN IF NOT EXISTS country TEXT`,
 	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS api_key_id BIGINT`,
+	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_title TEXT`,
+	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_image TEXT`,
+	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_description TEXT`,
+	`ALTER TABLE urls ADD COLUMN IF NOT EXISTS preview_fetched_at BIGINT`,
 }
 
 // NewPostgresStore opens a connection pool against dsn and applies the
@@ -161,16 +165,22 @@ func (s *PostgresStore) Set(code string, m *models.URLMapping) error {
 	if m.ExpiresAt != nil {
 		expiresAt = m.ExpiresAt.UnixNano()
 	}
+	var previewFetched any
+	if m.PreviewFetchedAt != nil {
+		previewFetched = m.PreviewFetchedAt.UnixNano()
+	}
 	// ON CONFLICT DO NOTHING is Postgres's INSERT-IGNORE; we read
 	// RowsAffected to detect the collision, matching the SQLite
 	// "INSERT OR IGNORE → RowsAffected==0" contract.
 	res, err := s.db.Exec(
-		`INSERT INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id)
-		 VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13)
+		`INSERT INTO urls (short_code, original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash, tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id, preview_title, preview_image, preview_description, preview_fetched_at)
+		 VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		 ON CONFLICT (short_code) DO NOTHING`,
 		code, m.OriginalURL, m.CreatedAt.UnixNano(), expiresAt, m.ClickCount, m.OwnerTokenHash,
 		tagsJSON, nullableInt(m.MaxClicks), nullableBlob(m.PasswordHash), nullableBlob(m.PasswordSalt),
 		nullableText(m.WebhookURL), nullableBlob(m.WebhookSecret), nullableInt(m.APIKeyID),
+		nullableText(m.PreviewTitle), nullableText(m.PreviewImage), nullableText(m.PreviewDescription),
+		previewFetched,
 	)
 	if err != nil {
 		return err
@@ -200,13 +210,19 @@ func (s *PostgresStore) Get(code string) (*models.URLMapping, error) {
 		webhookURL     sql.NullString
 		webhookSecret  []byte
 		apiKeyID       sql.NullInt64
+		previewTitle   sql.NullString
+		previewImage   sql.NullString
+		previewDesc    sql.NullString
+		previewFetched sql.NullInt64
 	)
 	err := s.db.QueryRow(
 		`SELECT original_url, created_at, expires_at, click_count, last_accessed, owner_token_hash,
-		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id
+		        tags, max_clicks, password_hash, password_salt, webhook_url, webhook_secret, api_key_id,
+		        preview_title, preview_image, preview_description, preview_fetched_at
 		 FROM urls WHERE short_code = $1`, code,
 	).Scan(&originalURL, &createdAt, &expiresAt, &clickCount, &lastAccessed, &ownerTokenHash,
-		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID)
+		&tagsJSON, &maxClicks, &passwordHash, &passwordSalt, &webhookURL, &webhookSecret, &apiKeyID,
+		&previewTitle, &previewImage, &previewDesc, &previewFetched)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -215,16 +231,23 @@ func (s *PostgresStore) Get(code string) (*models.URLMapping, error) {
 	}
 
 	m := &models.URLMapping{
-		ID:             code,
-		OriginalURL:    originalURL,
-		CreatedAt:      time.Unix(0, createdAt),
-		ClickCount:     clickCount,
-		OwnerTokenHash: ownerTokenHash,
-		PasswordHash:   passwordHash,
-		PasswordSalt:   passwordSalt,
-		WebhookURL:     webhookURL.String,
-		WebhookSecret:  webhookSecret,
-		APIKeyID:       apiKeyID.Int64,
+		ID:                 code,
+		OriginalURL:        originalURL,
+		CreatedAt:          time.Unix(0, createdAt),
+		ClickCount:         clickCount,
+		OwnerTokenHash:     ownerTokenHash,
+		PasswordHash:       passwordHash,
+		PasswordSalt:       passwordSalt,
+		WebhookURL:         webhookURL.String,
+		WebhookSecret:      webhookSecret,
+		APIKeyID:           apiKeyID.Int64,
+		PreviewTitle:       previewTitle.String,
+		PreviewImage:       previewImage.String,
+		PreviewDescription: previewDesc.String,
+	}
+	if previewFetched.Valid {
+		t := time.Unix(0, previewFetched.Int64)
+		m.PreviewFetchedAt = &t
 	}
 	if expiresAt.Valid {
 		t := time.Unix(0, expiresAt.Int64)
@@ -426,6 +449,22 @@ func (s *PostgresStore) Update(code string, f UpdateFields) error {
 	if f.APIKeyID != nil {
 		sets = append(sets, "api_key_id = "+next())
 		args[len(args)-1] = nullableInt(*f.APIKeyID)
+	}
+	if f.PreviewTitle != nil {
+		sets = append(sets, "preview_title = "+next())
+		args[len(args)-1] = nullableText(*f.PreviewTitle)
+	}
+	if f.PreviewImage != nil {
+		sets = append(sets, "preview_image = "+next())
+		args[len(args)-1] = nullableText(*f.PreviewImage)
+	}
+	if f.PreviewDescription != nil {
+		sets = append(sets, "preview_description = "+next())
+		args[len(args)-1] = nullableText(*f.PreviewDescription)
+	}
+	if f.SetPreviewFetched {
+		sets = append(sets, "preview_fetched_at = "+next())
+		args[len(args)-1] = time.Now().UnixNano()
 	}
 
 	if len(sets) == 0 {

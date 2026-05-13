@@ -817,9 +817,12 @@
         }
         grid.appendChild(left);
 
-        // Right column: QR (share) + edit + token + delete (manage)
+        // Right column: preview card (if available) + QR (share) +
+        // edit + token + delete (manage)
         const right = document.createElement('div');
         right.className = 'detail-block';
+        const preview = buildPreviewBlock(row);
+        if (preview) right.appendChild(preview);
         right.appendChild(buildQRBlock(row));
         const rh = document.createElement('h3');
         rh.textContent = 'Manage';
@@ -1295,6 +1298,58 @@
             if (e.key === 'Enter') { e.preventDefault(); field.input.blur(); }
         });
         wrap.appendChild(field.field);
+        return wrap;
+    }
+
+    /**
+     * Preview card built from the server-side unfurl. Hidden entirely
+     * when no fields are populated, even after a fetch attempt — empty
+     * preview metadata is normal for many sites and a "no preview"
+     * placeholder would clutter the panel.
+     */
+    function buildPreviewBlock(row) {
+        const d = row.data;
+        if (!d) return null;
+        const hasAny = d.preview_title || d.preview_image || d.preview_description;
+        if (!hasAny) return null;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'preview-block';
+        const h = document.createElement('h3');
+        h.textContent = 'Preview';
+        wrap.appendChild(h);
+
+        const card = document.createElement('div');
+        card.className = 'preview-card';
+
+        if (d.preview_image) {
+            const img = document.createElement('img');
+            img.src = d.preview_image;
+            img.alt = '';
+            img.loading = 'lazy';
+            img.className = 'preview-img';
+            // Hide a broken image rather than showing the alt text in
+            // a box that's obviously placeholder-shaped.
+            img.addEventListener('error', () => { img.style.display = 'none'; });
+            card.appendChild(img);
+        }
+
+        const text = document.createElement('div');
+        text.className = 'preview-text';
+        if (d.preview_title) {
+            const t = document.createElement('div');
+            t.className = 'preview-title';
+            t.textContent = d.preview_title;
+            text.appendChild(t);
+        }
+        if (d.preview_description) {
+            const desc = document.createElement('div');
+            desc.className = 'preview-desc';
+            desc.textContent = d.preview_description;
+            text.appendChild(desc);
+        }
+        card.appendChild(text);
+        wrap.appendChild(card);
         return wrap;
     }
 

@@ -69,6 +69,15 @@ type Config struct {
 	WebhookWorkers   int
 	WebhookQueueSize int
 	WebhookTimeout   time.Duration
+	// UnfurlEnabled flips the URL-preview/unfurl feature on. Off by
+	// default because it triggers outbound HTTP from the server to
+	// every shortened destination — operators who don't want that
+	// behaviour (or who serve a private corpus) leave it off and the
+	// preview fields stay empty.
+	UnfurlEnabled   bool
+	UnfurlWorkers   int
+	UnfurlQueueSize int
+	UnfurlTimeout   time.Duration
 }
 
 // Load reads configuration from environment variables, falling back to safe defaults.
@@ -98,6 +107,10 @@ func Load() Config {
 		WebhookWorkers:       getEnvInt("WEBHOOK_WORKERS", 4),
 		WebhookQueueSize:     getEnvInt("WEBHOOK_QUEUE", 256),
 		WebhookTimeout:       time.Duration(getEnvInt("WEBHOOK_TIMEOUT_MS", 5000)) * time.Millisecond,
+		UnfurlEnabled:        os.Getenv("UNFURL_ENABLED") == "true",
+		UnfurlWorkers:        getEnvInt("UNFURL_WORKERS", 4),
+		UnfurlQueueSize:      getEnvInt("UNFURL_QUEUE", 256),
+		UnfurlTimeout:        time.Duration(getEnvInt("UNFURL_TIMEOUT_MS", 3000)) * time.Millisecond,
 	}
 }
 

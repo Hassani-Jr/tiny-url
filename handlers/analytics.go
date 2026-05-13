@@ -53,16 +53,20 @@ func (h *AnalyticsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := models.AnalyticsResponse{
-		ShortCode:    urlMapping.ID,
-		OriginalURL:  urlMapping.OriginalURL,
-		ClickCount:   atomic.LoadInt64(&urlMapping.ClickCount),
-		CreatedAt:    urlMapping.CreatedAt,
-		ExpiresAt:    urlMapping.ExpiresAt,
-		LastAccessed: urlMapping.LastAccessed,
-		Tags:         urlMapping.Tags,
-		MaxClicks:    urlMapping.MaxClicks,
-		HasPassword:  len(urlMapping.PasswordHash) > 0,
-		WebhookURL:   urlMapping.WebhookURL,
+		ShortCode:          urlMapping.ID,
+		OriginalURL:        urlMapping.OriginalURL,
+		ClickCount:         atomic.LoadInt64(&urlMapping.ClickCount),
+		CreatedAt:          urlMapping.CreatedAt,
+		ExpiresAt:          urlMapping.ExpiresAt,
+		LastAccessed:       urlMapping.LastAccessed,
+		Tags:               urlMapping.Tags,
+		MaxClicks:          urlMapping.MaxClicks,
+		HasPassword:        len(urlMapping.PasswordHash) > 0,
+		WebhookURL:         urlMapping.WebhookURL,
+		PreviewTitle:       urlMapping.PreviewTitle,
+		PreviewImage:       urlMapping.PreviewImage,
+		PreviewDescription: urlMapping.PreviewDescription,
+		PreviewFetchedAt:   urlMapping.PreviewFetchedAt,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

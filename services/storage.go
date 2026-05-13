@@ -127,6 +127,15 @@ type UpdateFields struct {
 	// given API key. Pointer because 0 means "clear" — distinguishing
 	// that from "leave alone" needs the explicit-nil convention.
 	APIKeyID *int64
+	// Preview fields are written only by the async Unfurler service.
+	// The PATCH handler intentionally doesn't expose these to callers;
+	// the API is "system-only" so a third party can't poison the
+	// dashboard's preview cards. Setting any of these implies an
+	// unfurl attempt completed, so SetPreviewFetched stamps the row.
+	PreviewTitle       *string
+	PreviewImage       *string
+	PreviewDescription *string
+	SetPreviewFetched  bool // when true, PreviewFetchedAt is stamped to now
 }
 
 // memoryClickCapPerCode bounds the in-memory event log per short code so a
@@ -294,6 +303,19 @@ func (s *MemoryStore) Update(code string, f UpdateFields) error {
 	}
 	if f.APIKeyID != nil {
 		m.APIKeyID = *f.APIKeyID
+	}
+	if f.PreviewTitle != nil {
+		m.PreviewTitle = *f.PreviewTitle
+	}
+	if f.PreviewImage != nil {
+		m.PreviewImage = *f.PreviewImage
+	}
+	if f.PreviewDescription != nil {
+		m.PreviewDescription = *f.PreviewDescription
+	}
+	if f.SetPreviewFetched {
+		now := time.Now()
+		m.PreviewFetchedAt = &now
 	}
 	return nil
 }

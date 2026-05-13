@@ -490,6 +490,7 @@ All settings are loaded from environment variables with sensible defaults. No co
 | `SHUTDOWN_DRAIN_SECS` | `5` | Sleep window between SIGTERM and `server.Shutdown` so load balancers and service-mesh sidecars can finish propagating the deregistration. Set to `0` to skip the drain. |
 | `METRICS_TOKEN` | (none) | When set, `GET /metrics` and `GET /api/audit` require `Authorization: Bearer <token>`. Empty (the default) leaves both endpoints open — fine when they're firewalled or only reachable on a private network; set this when scrapers cross an untrusted boundary. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (none) | When set, traces are exported via OTLP/HTTP to this endpoint (e.g. `http://otel-collector:4318`). Reads all standard `OTEL_*` env vars — `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_HEADERS`, etc. Empty (the default) disables the exporter; W3C trace-context propagation still works inbound/outbound so child services see the same trace ID. |
+| `UNFURL_ENABLED` | `false` | When `true`, the server asynchronously fetches each shortened destination, parses `<title>` + `og:*` meta, and stores the result so the dashboard can render a preview card. Off by default because it triggers outbound HTTP from the server to user-supplied URLs — the same SSRF re-check / size cap / no-follow-redirect posture as webhooks applies. |
 
 ### Example: Production Deployment
 
