@@ -210,4 +210,3 @@ func hasLabel(m *dto.Metric, name, value string) bool {
 	}
 	return false
 }
-
