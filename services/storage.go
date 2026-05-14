@@ -196,17 +196,36 @@ func (s *MemoryStore) Set(code string, m *models.URLMapping) error {
 	return nil
 }
 
+// Get returns a SNAPSHOT of the URL mapping — never the canonical
+// pointer held in the map. The copy is made under the read lock so a
+// concurrent Update (Unfurler, PATCH, RotateToken, …) cannot tear the
+// struct fields the caller reads after return.
+//
+// The slice fields (Tags, Destinations, PasswordHash, PasswordSalt,
+// WebhookSecret, OwnerTokenHash) share their underlying array with
+// the stored mapping. That's safe because every Update path REPLACES
+// the slice header instead of mutating the contents — readers that
+// captured the old header continue to see consistent data.
+//
+// ClickCount is a value field; readers get a frozen point-in-time
+// count. The atomic increments in RecordClick mutate the canonical
+// stored pointer, not the snapshot, so subsequent calls to Get see a
+// newer value. This trade-off is fine because every consumer reads
+// the count via atomic.LoadInt64(&snapshot.ClickCount) and treats
+// the result as advisory anyway.
 func (s *MemoryStore) Get(code string) (*models.URLMapping, error) {
 	s.mu.RLock()
 	m, ok := s.urls[code]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		return nil, ErrNotFound
 	}
-	if m.ExpiresAt != nil && time.Now().After(*m.ExpiresAt) {
+	snap := *m
+	s.mu.RUnlock()
+	if snap.ExpiresAt != nil && time.Now().After(*snap.ExpiresAt) {
 		return nil, ErrExpired
 	}
-	return m, nil
+	return &snap, nil
 }
 
 // Delete removes a mapping (and its event log) atomically. Returns
