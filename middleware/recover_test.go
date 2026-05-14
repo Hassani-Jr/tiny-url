@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestRecoverCatchesPanic(t *testing.T) {
@@ -56,14 +59,31 @@ func TestRecoverPassesThroughHealthyHandler(t *testing.T) {
 }
 
 func TestRecoverIncrementsCounter(t *testing.T) {
-	before := panicsTotal.Value()
+	before := readPanicsTotal(t)
 	handler := Recover(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
 		panic("counted")
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	handler.ServeHTTP(httptest.NewRecorder(), req)
-	after := panicsTotal.Value()
+	after := readPanicsTotal(t)
 	if after != before+1 {
-		t.Errorf("panics_total: before=%d after=%d, want +1", before, after)
+		t.Errorf("panics_total: before=%g after=%g, want +1", before, after)
 	}
+}
+
+// readPanicsTotal reads the current value of the Prometheus counter via
+// Collect(). The client_golang Counter type doesn't expose a getter, but
+// Collect emits a prometheus.Metric whose .Write fills a dto.Metric we
+// can inspect.
+func readPanicsTotal(t *testing.T) float64 {
+	t.Helper()
+	ch := make(chan prometheus.Metric, 1)
+	panicsTotal.Collect(ch)
+	close(ch)
+	m := <-ch
+	var pb dto.Metric
+	if err := m.Write(&pb); err != nil {
+		t.Fatalf("write metric: %v", err)
+	}
+	return pb.GetCounter().GetValue()
 }

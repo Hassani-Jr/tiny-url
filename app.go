@@ -40,7 +40,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 
 	clickStream := services.NewClickStream()
 	dnsCache := services.NewDNSCache(5*time.Second, 1024)
-	geoIP := services.NewGeoIP()
+	geoIP := services.NewGeoIP(cfg.GeoIPDBPath)
 	webhookDispatcher := services.NewWebhookDispatcher(
 		cfg.WebhookWorkers, cfg.WebhookQueueSize, cfg.WebhookTimeout,
 	)
@@ -82,6 +82,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	streamHandler := handlers.NewStreamHandler(store, clickStream)
 	analyticsHandler := handlers.NewAnalyticsHandler(store)
 	clicksHandler := handlers.NewClicksHandler(store, 200)
+	exportHandler := handlers.NewExportHandler(store, 0)
 	seriesHandler := handlers.NewSeriesHandler(store)
 	deleteHandler := handlers.NewDeleteHandler(store)
 	patchHandler := handlers.NewPatchHandler(store, cfg.MaxExpirationMinutes, cfg.MaxBodyBytes, denyList)
@@ -134,6 +135,7 @@ func buildHandler(ctx context.Context, cfg config.Config, store services.Store) 
 	appMux.Handle("GET /api/audit", auditHandler)
 	appMux.Handle("GET /api/analytics/{code}", analyticsHandler)
 	appMux.Handle("GET /api/analytics/{code}/clicks", clicksHandler)
+	appMux.Handle("GET /api/analytics/{code}/export", exportHandler)
 	appMux.Handle("GET /api/analytics/{code}/series", seriesHandler)
 	// Live event stream (SSE). Mounted on appMux so it goes through the
 	// read rate limiter, but a single connection counts once and stays

@@ -1,17 +1,26 @@
 package middleware
 
 import (
-	"expvar"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // panicsTotal is incremented every time Recover catches a handler panic.
-// Surfacing it in the metrics map lets operators alert on a sudden spike
-// rather than discovering the problem only when somebody complains a page
-// is broken.
-var panicsTotal = expvar.NewInt("panics_total")
+// Surfacing it on /metrics lets operators alert on a sudden spike rather
+// than discovering the problem only when somebody complains a page is
+// broken. Registered against the package-private metricsRegistry from
+// metrics.go so it ships with the same exposition as the request counters.
+var panicsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "tinyurl_panics_total",
+	Help: "Total panics caught by the Recover middleware.",
+})
+
+func init() {
+	metricsRegistry.MustRegister(panicsTotal)
+}
 
 // Recover catches panics from downstream handlers and converts them into
 // structured 500 responses. Without this, a panic kills the request mid-
@@ -29,7 +38,7 @@ func Recover(next http.Handler) http.Handler {
 			if rv == nil {
 				return
 			}
-			panicsTotal.Add(1)
+			panicsTotal.Inc()
 			slog.ErrorContext(r.Context(), "panic recovered",
 				"method", r.Method,
 				"path", r.URL.Path,

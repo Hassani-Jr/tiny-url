@@ -20,7 +20,7 @@ The full REST API is documented in [`static/openapi.yaml`](static/openapi.yaml) 
 - **Background Cleanup**: Automatic removal of expired URLs
 - **Owner Delete & Edit**: `DELETE /api/url/{code}` removes a short link; `PATCH /api/url/{code}` updates the destination URL and/or expiration. Both gated by the per-URL admin token.
 - **Per-Click Event Log**: `GET /api/analytics/{code}/clicks` returns each click's timestamp, coarse device class, truncated Referer, and (optionally) a salted IP hash. Privacy-respecting by default — raw User-Agent is never stored.
-- **Observability**: Structured (`slog`) logs with per-request `X-Request-ID` correlation; `/metrics` (expvar) and `/readyz` (storage-aware readiness) endpoints alongside `/healthz`
+- **Observability**: Structured (`slog`) logs with per-request `X-Request-ID` correlation; `/metrics` (Prometheus text exposition) and `/readyz` (storage-aware readiness) endpoints alongside `/healthz`
 
 ## Quick Start
 
@@ -293,14 +293,14 @@ Returns `200 OK` with `{"status":"ready"}` when the storage backend responds to 
 curl http://localhost:8080/metrics
 ```
 
-Returns the standard Go `expvar` JSON exposition. Includes:
-- `http_requests_total` — map keyed by status class (`2xx`, `4xx`, `5xx`, …)
-- `http_requests_route_total` — map keyed by `<matched ServeMux pattern>|<status_class>` (e.g., `"GET /{code}|2xx"`). Lets operators see which endpoint is hot or failing without parsing logs. Unmatched paths are deliberately not counted to keep an attacker from pinning unbounded keys with random URLs.
-- `http_requests_in_flight` — current concurrent requests
-- `panics_total` — every time the Recover middleware catches a handler panic. Alert on a sudden spike.
-- standard runtime metrics (`memstats`, `cmdline`)
+Returns the Prometheus text exposition format. Includes:
+- `tinyurl_http_requests_total{route,status_class}` — request counter labelled by matched ServeMux pattern (e.g. `"GET /{code}"`) and status class (`2xx`, `4xx`, `5xx`, …). Unmatched paths fold into a single `route="unmatched"` series so an attacker spraying random URLs can't explode label cardinality.
+- `tinyurl_http_request_duration_seconds{route,status_class}` — latency histogram with default buckets.
+- `tinyurl_http_requests_in_flight` — current concurrent requests
+- `tinyurl_panics_total` — every time the Recover middleware catches a handler panic. Alert on a sudden spike.
+- Standard `process_*` and `go_*` collectors (RSS, GC pauses, goroutine count).
 
-By default the endpoint is open — firewall it or scrape from a private network. Set `METRICS_TOKEN` to require `Authorization: Bearer <token>` on every scrape (Prometheus's `bearer_token_file` integrates cleanly). To switch from expvar to native Prometheus exposition, swap `middleware.GatedMetricsHandler(...)` in `main.go` for `promhttp.Handler()` from `github.com/prometheus/client_golang`.
+By default the endpoint is open — firewall it or scrape from a private network. Set `METRICS_TOKEN` to require `Authorization: Bearer <token>` on every scrape (Prometheus's `bearer_token_file` integrates cleanly).
 
 #### Request Correlation
 

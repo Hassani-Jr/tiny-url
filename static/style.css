@@ -272,6 +272,54 @@ kbd {
     margin-top: var(--gap);
 }
 
+/* A/B routing editor — used by both the create form and the per-row
+   edit form. The ab-row is intentionally a flex layout (URL grows,
+   weight is a fixed small number input, remove fits to content) so
+   the controls reflow cleanly on narrow screens. */
+.ab-section { margin-top: var(--gap); }
+.ab-section summary {
+    cursor: pointer;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    padding: 0.25rem 0;
+    user-select: none;
+}
+.ab-section summary:hover { color: var(--text); }
+.ab-list { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.5rem; }
+.ab-row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+}
+.ab-row input[type="url"] {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.4rem 0.6rem;
+    color: var(--text);
+    font-size: 0.85rem;
+}
+.ab-row input[type="number"] {
+    width: 5rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.4rem 0.5rem;
+    color: var(--text);
+    font-size: 0.85rem;
+    text-align: right;
+}
+.ab-row input:focus { outline: none; border-color: var(--primary); }
+.ab-actions { margin-top: 0.5rem; }
+.ab-empty {
+    font-size: 0.8rem;
+    color: var(--text-faint);
+    font-style: italic;
+    padding: 0.4rem 0;
+}
+
 @keyframes slideDown {
     from { opacity: 0; transform: translateY(-6px); }
     to   { opacity: 1; transform: translateY(0); }

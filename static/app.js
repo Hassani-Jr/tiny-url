@@ -64,6 +64,8 @@
         webhookInput:   $('webhookInput'),
         cancelCreateBtn:$('cancelCreateBtn'),
         createBtn:      $('createBtn'),
+        createDestinations: $('createDestinations'),
+        addDestBtn:     $('addDestBtn'),
 
         keyBtn:            $('keyBtn'),
         keyPanel:          $('keyPanel'),
@@ -324,7 +326,7 @@
         }
     }
 
-    async function apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url }) {
+    async function apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url, destinations }) {
         const body = { url };
         if (custom_code) body.custom_code = custom_code;
         if (expiration_mins) body.expiration_mins = expiration_mins;
@@ -332,6 +334,7 @@
         if (max_clicks) body.max_clicks = max_clicks;
         if (password) body.password = password;
         if (webhook_url) body.webhook_url = webhook_url;
+        if (destinations && destinations.length) body.destinations = destinations;
         const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' };
         // Authenticate the create request when an API key is active so
         // the server claims ownership for that key (api_key_id is set
@@ -1217,6 +1220,40 @@
         wrap.appendChild(maxField.field);
         wrap.appendChild(pwField.field);
         wrap.appendChild(hookField.field);
+
+        // A/B destinations editor. Mirrors the create form layout so the
+        // visual model is consistent. Seeded with the current pool so a
+        // user can edit weights in place; an empty pool collapses the
+        // <details> by default to keep the form small for the common
+        // single-destination case.
+        const abWrap = document.createElement('details');
+        abWrap.className = 'ab-section';
+        const existing = row.data?.destinations || [];
+        if (existing.length > 0) abWrap.open = true;
+        const abSummary = document.createElement('summary');
+        abSummary.textContent = existing.length
+            ? `A/B routing (${existing.length} destination${existing.length === 1 ? '' : 's'})`
+            : 'A/B routing';
+        const abList = document.createElement('div');
+        abList.className = 'ab-list';
+        const abActions = document.createElement('div');
+        abActions.className = 'ab-actions';
+        const abAdd = makeBtn('+ Add destination', 'btn btn-ghost btn-sm', () => {
+            const current = abList.querySelectorAll('.ab-row').length;
+            if (current >= MAX_DESTINATIONS) {
+                toast(`Up to ${MAX_DESTINATIONS} destinations allowed.`, 'error');
+                return;
+            }
+            appendDestinationRow(abList);
+            const last = abList.querySelector('.ab-row:last-child input[type="url"]');
+            if (last) last.focus();
+        });
+        abActions.appendChild(abAdd);
+        for (const d of existing) appendDestinationRow(abList, d);
+        abWrap.appendChild(abSummary);
+        abWrap.appendChild(abList);
+        abWrap.appendChild(abActions);
+        wrap.appendChild(abWrap);
         if (row.data?.webhook_url) {
             // Surface a "rotate secret" affordance only when there's an
             // existing webhook to rotate against. Clicking issues a PATCH
@@ -1277,6 +1314,26 @@
             if (hookVal === 'off') body.webhook_url = '';
             else if (hookVal !== '' && hookVal !== curHook) body.webhook_url = hookVal;
 
+            // Destinations: only PATCH when the pool actually changed
+            // (count or any url/weight differs from the current state).
+            // PATCH semantics: an empty array clears the pool back to
+            // single-destination mode, so we DO send [] when the user
+            // removed every row but the current pool had entries.
+            let newDests;
+            try {
+                newDests = readDestinations(abList);
+            } catch (err) {
+                toast(err.message, 'error');
+                return;
+            }
+            if (newDests.length > MAX_DESTINATIONS) {
+                toast(`Up to ${MAX_DESTINATIONS} destinations allowed.`, 'error');
+                return;
+            }
+            if (!sameDestinations(newDests, existing)) {
+                body.destinations = newDests;
+            }
+
             if (Object.keys(body).length === 0) {
                 toast('Nothing to save.', 'info');
                 return;
@@ -1305,6 +1362,21 @@
         if (a.length !== b.length) return false;
         for (let i = 0; i < a.length; i++) {
             if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Structural equality on a destination pool. Order matters because the
+     * server's weighted picker iterates the slice in order, so swapping
+     * two entries with identical weights would still be a meaningful
+     * change for any client doing position-based reads (none today, but
+     * we don't gratuitously suppress the PATCH either).
+     */
+    function sameDestinations(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i].url !== b[i].url || a[i].weight !== b[i].weight) return false;
         }
         return true;
     }
@@ -1759,6 +1831,86 @@
         }
     }
 
+    // ---------- A/B destinations editor -----------------------------------
+
+    // MAX_DESTINATIONS matches services.ValidateDestinations on the server
+    // (handlers/shorten.go:311). Keeping them in sync avoids round-tripping
+    // a 400 for a count the client already knew was too big.
+    const MAX_DESTINATIONS = 10;
+
+    /**
+     * Append a single destination row (URL + weight) to `container`. Returns
+     * the wrapper element so callers can remove it directly. `seed` is an
+     * optional {url, weight} pair to prefill — used by the edit form to
+     * restore the existing pool. Pool emptiness is rendered via the
+     * caller's renderEmpty() hook, NOT here.
+     */
+    function appendDestinationRow(container, seed) {
+        const row = document.createElement('div');
+        row.className = 'ab-row';
+
+        const url = document.createElement('input');
+        url.type = 'url';
+        url.placeholder = 'https://example.com/variant-b';
+        url.required = true;
+        if (seed && seed.url) url.value = seed.url;
+
+        const weight = document.createElement('input');
+        weight.type = 'number';
+        weight.min = '1';
+        weight.max = '100';
+        weight.placeholder = 'weight';
+        weight.value = seed && Number.isFinite(seed.weight) ? String(seed.weight) : '50';
+
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'btn btn-ghost btn-sm';
+        rm.textContent = '✕';
+        rm.title = 'Remove this destination';
+        rm.addEventListener('click', () => {
+            row.remove();
+            container.dispatchEvent(new Event('ab:changed'));
+        });
+
+        row.appendChild(url);
+        row.appendChild(weight);
+        row.appendChild(rm);
+        container.appendChild(row);
+        container.dispatchEvent(new Event('ab:changed'));
+        return row;
+    }
+
+    /**
+     * Collect the destinations entered in `container` into a plain array.
+     * Drops fully-blank rows (URL empty AND weight default) so a user who
+     * clicked "+ Add destination" but never filled in the row doesn't
+     * cause a 400. Throws when a row has only one half populated — that's
+     * almost certainly a typo, not a deliberate config.
+     */
+    function readDestinations(container) {
+        const rows = container.querySelectorAll('.ab-row');
+        const out = [];
+        for (const row of rows) {
+            const inputs = row.querySelectorAll('input');
+            const url = inputs[0].value.trim();
+            const weightRaw = inputs[1].value.trim();
+            if (!url && weightRaw === '') continue;
+            if (!url || weightRaw === '') {
+                throw new Error('Each A/B row needs both a URL and a weight (or leave the whole row blank to drop it).');
+            }
+            const weight = parseInt(weightRaw, 10);
+            if (!Number.isFinite(weight) || weight < 1 || weight > 100) {
+                throw new Error('Weights must be between 1 and 100.');
+            }
+            out.push({ url, weight });
+        }
+        return out;
+    }
+
+    function clearDestinations(container) {
+        container.replaceChildren();
+    }
+
     // ---------- create flow -----------------------------------------------
 
     function openCreate() {
@@ -1769,6 +1921,7 @@
     function closeCreate() {
         els.createPanel.classList.add('hidden');
         els.createForm.reset();
+        clearDestinations(els.createDestinations);
     }
 
     async function submitCreate(e) {
@@ -1784,12 +1937,23 @@
         const max_clicks = maxClicksRaw ? parseInt(maxClicksRaw, 10) : undefined;
         const password = els.passwordInput.value;
         const webhook_url = els.webhookInput.value.trim();
+        let destinations;
+        try {
+            destinations = readDestinations(els.createDestinations);
+        } catch (err) {
+            toast(err.message, 'error');
+            return;
+        }
+        if (destinations.length > MAX_DESTINATIONS) {
+            toast(`Up to ${MAX_DESTINATIONS} destinations allowed.`, 'error');
+            return;
+        }
 
         els.createBtn.disabled = true;
         const original = els.createBtn.textContent;
         els.createBtn.textContent = 'Creating…';
         try {
-            const data = await apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url });
+            const data = await apiCreate({ url, custom_code, expiration_mins, tags, max_clicks, password, webhook_url, destinations });
             saveToken(data.short_code, data.admin_token);
             const seed = {
                 short_code: data.short_code,
@@ -1802,6 +1966,7 @@
                 max_clicks: data.max_clicks || 0,
                 has_password: !!data.has_password,
                 webhook_url: data.webhook_url || '',
+                destinations: data.destinations || [],
             };
             // The webhook secret is returned ONCE — surface it in a toast
             // with a copy button so the user can stash it. (We can't
@@ -2135,6 +2300,19 @@
         els.emptyCreateBtn.addEventListener('click', openCreate);
         els.cancelCreateBtn.addEventListener('click', closeCreate);
         els.createForm.addEventListener('submit', submitCreate);
+        els.addDestBtn.addEventListener('click', () => {
+            const current = els.createDestinations.querySelectorAll('.ab-row').length;
+            if (current >= MAX_DESTINATIONS) {
+                toast(`Up to ${MAX_DESTINATIONS} destinations allowed.`, 'error');
+                return;
+            }
+            appendDestinationRow(els.createDestinations);
+            // Focus the URL input of the newly-added row so users can start
+            // typing immediately — same pattern as openCreate() focusing
+            // the primary URL field.
+            const last = els.createDestinations.querySelector('.ab-row:last-child input[type="url"]');
+            if (last) last.focus();
+        });
 
         els.keyBtn.addEventListener('click', openKeyPanel);
         els.keyCancelBtn.addEventListener('click', closeKeyPanel);

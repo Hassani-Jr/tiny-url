@@ -15,7 +15,7 @@ func TestGeoIPPlaceholderIsNoop(t *testing.T) {
 	if len(embeddedGeoIP) != 0 {
 		t.Skip("embedded mmdb is non-empty — likely a real GeoLite2 file is in place. The placeholder test only applies to the no-op fallback.")
 	}
-	g := NewGeoIP()
+	g := NewGeoIP("")
 	for _, ip := range []net.IP{
 		net.ParseIP("8.8.8.8"),
 		net.ParseIP("1.1.1.1"),

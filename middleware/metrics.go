@@ -2,64 +2,106 @@ package middleware
 
 import (
 	"crypto/subtle"
-	"expvar"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Metrics middleware feeds counters that are published via /metrics
-// (expvar.Handler). The numbers stay coarse on purpose — request totals
-// bucketed by status class and an in-flight gauge. Anything finer (per-route
-// histograms, p99 latency) belongs in Prometheus / OpenTelemetry, which can
-// scrape the same path or replace this entirely.
+// Metrics middleware feeds counters exposed via /metrics in the
+// Prometheus text exposition format. We deliberately keep the label
+// cardinality bounded: `route` is the matched ServeMux pattern (or
+// "unmatched" when r.Pattern is empty), NOT the literal request path —
+// otherwise a path-spraying attacker could pin an unbounded number of
+// label-tuple series and OOM the process.
 var (
-	httpRequestsTotal      = expvar.NewMap("http_requests_total")
-	httpRequestsRouteTotal = expvar.NewMap("http_requests_route_total")
-	httpRequestsInFlight   = expvar.NewInt("http_requests_in_flight")
-	inFlight               atomic.Int64
+	httpRequestsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "tinyurl_http_requests_total",
+		Help: "Total HTTP requests handled, labelled by matched route and status class.",
+	}, []string{"route", "status_class"})
+
+	httpRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "tinyurl_http_request_duration_seconds",
+		Help:    "HTTP request latency by route and status class.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"route", "status_class"})
+
+	httpRequestsInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tinyurl_http_requests_in_flight",
+		Help: "Number of HTTP requests currently being served.",
+	})
+
+	// inFlight backs the gauge with an atomic so the read/inc/set
+	// sequence is consistent across goroutines under high concurrency.
+	// The gauge.Set call is fed the post-increment value to avoid two
+	// readers racing to publish stale numbers.
+	inFlight atomic.Int64
 )
+
+// metricsRegistry is the registry exposed at /metrics. Kept private to
+// the package so handlers don't accidentally register colliding metric
+// names — if a caller needs to attach a metric they should add it here.
+// Using a dedicated registry instead of prometheus.DefaultRegisterer
+// keeps the exposition free of Go-runtime/process collectors by
+// default; operators who want those can add them explicitly.
+var metricsRegistry = prometheus.NewRegistry()
+
+func init() {
+	metricsRegistry.MustRegister(httpRequestsTotal)
+	metricsRegistry.MustRegister(httpRequestDuration)
+	metricsRegistry.MustRegister(httpRequestsInFlight)
+	// Include process + Go runtime collectors so operators get RSS,
+	// GC pause, goroutine count, etc. without per-deployment setup.
+	// These are low-cardinality and standard for any Prometheus
+	// exposition.
+	metricsRegistry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	metricsRegistry.MustRegister(collectors.NewGoCollector())
+}
 
 // Metrics increments the appropriate counters around the wrapped handler.
 // Order in the chain: place it AFTER RequestID and BEFORE rate limiting so
 // that rate-limited 429s are counted (they are real requests the operator
-// should see), but inert path-traversal 404s on /static are still attributed
-// to the right status class.
-//
-// Two counters are emitted:
-//   - http_requests_total: keyed by status class ("2xx", "4xx", …) for
-//     overall error-rate alerting.
-//   - http_requests_route_total: keyed by the matched ServeMux pattern
-//     (e.g. "GET /{code}|2xx") so operators can spot which endpoint is hot
-//     or failing without parsing logs. Unmatched requests (which produce
-//     a default 404) are skipped to avoid pinning unbounded keys from
-//     attacker-controlled paths.
+// should see), but inert path-traversal 404s on /static are still
+// attributed to the right status class. The matched route pattern is
+// read AFTER next.ServeHTTP — ServeMux only sets r.Pattern during
+// routing.
 func Metrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		httpRequestsInFlight.Set(inFlight.Add(1))
+		httpRequestsInFlight.Set(float64(inFlight.Add(1)))
+		start := time.Now()
 		wrapped := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(wrapped, r)
-		httpRequestsInFlight.Set(inFlight.Add(-1))
+		httpRequestsInFlight.Set(float64(inFlight.Add(-1)))
+
 		class := strconv.Itoa(wrapped.statusCode/100) + "xx"
-		httpRequestsTotal.Add(class, 1)
-		// r.Pattern is set by ServeMux when routing succeeds. Empty means
-		// "no matching route", which we deliberately don't count by route
-		// — those keys would be the request's literal path and an attacker
-		// could OOM the metrics map by spraying random paths.
-		if r.Pattern != "" {
-			httpRequestsRouteTotal.Add(r.Pattern+"|"+class, 1)
-		}
+		route := routeLabel(r.Pattern)
+		httpRequestsTotal.WithLabelValues(route, class).Inc()
+		httpRequestDuration.WithLabelValues(route, class).Observe(time.Since(start).Seconds())
 	})
 }
 
-// MetricsHandler returns the expvar JSON exposition handler. The endpoint
-// includes runtime internals (cmdline, memstats) and per-route counters —
-// not catastrophic to leak on its own, but useful intel for an attacker
-// who is mapping the service. Most operators firewall /metrics; for those
-// who can't, GatedMetricsHandler adds a static-token gate.
+// routeLabel maps r.Pattern to a bounded-cardinality label value.
+// Unmatched requests (r.Pattern == "") fold into a single bucket so an
+// attacker spraying random paths can't pin per-path label tuples.
+func routeLabel(pattern string) string {
+	if pattern == "" {
+		return "unmatched"
+	}
+	return pattern
+}
+
+// MetricsHandler returns the Prometheus text-exposition handler bound
+// to the package's private registry. The endpoint includes per-route
+// counters and runtime stats; useful intel for an attacker mapping the
+// service, so most operators firewall /metrics. For those who can't,
+// GatedMetricsHandler adds a static-token gate.
 func MetricsHandler() http.Handler {
-	return expvar.Handler()
+	return promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{})
 }
 
 // GatedMetricsHandler wraps MetricsHandler with a constant-time bearer-token

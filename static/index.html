@@ -61,6 +61,18 @@
                             <input type="url" id="webhookInput" placeholder="https://hooks.example.com/clicks">
                         </label>
                     </div>
+                    <details class="ab-section">
+                        <summary>A/B routing (optional)</summary>
+                        <p class="muted" style="margin: 0.4rem 0 0.6rem;">
+                            Send clicks to multiple destinations, weighted. Each entry is validated like the primary URL.
+                            Weights are relative; e.g. <code>70</code> + <code>30</code> sends 70% of clicks to the first.
+                            Up to 10 entries.
+                        </p>
+                        <div id="createDestinations" class="ab-list" aria-label="Destination pool"></div>
+                        <div class="ab-actions">
+                            <button type="button" id="addDestBtn" class="btn btn-ghost btn-sm">+ Add destination</button>
+                        </div>
+                    </details>
                     <div class="form-actions">
                         <button type="button" id="cancelCreateBtn" class="btn btn-ghost">Cancel</button>
                         <button type="submit" id="createBtn" class="btn btn-primary">Create</button>

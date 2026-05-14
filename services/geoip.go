@@ -43,8 +43,30 @@ type geoipRecord struct {
 // NewGeoIP loads the embedded mmdb. Returns a GeoIP whose Country method
 // always reports "" when the placeholder is in place — log line at
 // startup makes the state visible to operators.
-func NewGeoIP() *GeoIP {
+//
+// When path is non-empty it overrides the embedded bytes; useful for
+// operators who want to drop in a fresh GeoLite2 DB without rebuilding
+// the binary. Path lookup failures fall back to the embedded blob (which
+// is itself a no-op when the placeholder is in place), so a stale env
+// var never silently disables a real DB.
+func NewGeoIP(path string) *GeoIP {
 	g := &GeoIP{lookup: func(net.IP) string { return "" }}
+	if path != "" {
+		reader, err := maxminddb.Open(path)
+		if err != nil {
+			slog.Warn("geoip: failed to open db at path, falling back to embedded", "path", path, "err", err)
+		} else {
+			md := reader.Metadata
+			slog.Info("geoip loaded from path",
+				"path", path,
+				"db_type", md.DatabaseType,
+				"build_epoch", md.BuildEpoch,
+				"node_count", md.NodeCount)
+			g.reader = reader
+			g.lookup = newReaderLookup(reader)
+			return g
+		}
+	}
 	if len(embeddedGeoIP) == 0 {
 		slog.Info("geoip disabled (placeholder GeoLite2-Country.mmdb present); see services/geoipdata/README.md")
 		return g

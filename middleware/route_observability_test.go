@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"expvar"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 // TestLoggerCapturesRoutePattern verifies that aggregating by `route`
@@ -108,9 +109,9 @@ func TestLoggerLogsProbeFailures(t *testing.T) {
 	}
 }
 
-// TestMetricsCountsByRoute verifies the http_requests_route_total counter
-// keys on the matched pattern. Two requests to different short codes that
-// hit the same route increment the same counter — the whole reason for
+// TestMetricsCountsByRoute verifies the per-route counter keys on the
+// matched pattern. Two requests to different short codes that hit the
+// same route increment the same counter — the whole reason for
 // collapsing on r.Pattern instead of r.URL.Path.
 func TestMetricsCountsByRoute(t *testing.T) {
 	mux := http.NewServeMux()
@@ -119,76 +120,94 @@ func TestMetricsCountsByRoute(t *testing.T) {
 	}))
 	handler := Metrics(mux)
 
+	before := counterValue(t, "GET /api/url/{code}", "2xx")
 	for _, code := range []string{"aaa", "bbb", "ccc"} {
 		req := httptest.NewRequest(http.MethodGet, "/api/url/"+code, nil)
 		req = req.WithContext(context.Background())
 		handler.ServeHTTP(httptest.NewRecorder(), req)
 	}
+	after := counterValue(t, "GET /api/url/{code}", "2xx")
 
-	// expvar maps don't expose Get; serialize and inspect.
-	dump := dumpExpvar(t)
-	routeMap, ok := dump["http_requests_route_total"].(map[string]any)
-	if !ok {
-		t.Fatalf("http_requests_route_total missing or wrong type: %#v", dump["http_requests_route_total"])
-	}
-	key := "GET /api/url/{code}|2xx"
-	got, ok := routeMap[key].(float64)
-	if !ok || got < 3 {
-		t.Errorf("counter[%q] = %v (type %T), want >= 3", key, routeMap[key], routeMap[key])
+	if got := after - before; got < 3 {
+		t.Errorf("counter delta = %v, want >= 3", got)
 	}
 }
 
-// TestMetricsSkipsUnroutedRequests ensures unmatched paths don't pin
-// per-path entries in the metrics map (an attacker spraying random paths
-// could otherwise OOM the process).
-func TestMetricsSkipsUnroutedRequests(t *testing.T) {
-	// A handler that bypasses any ServeMux: r.Pattern stays "" and the
-	// per-route counter must NOT increment, even though the status counter
-	// does.
+// TestMetricsUnroutedFoldsToSingleBucket ensures unmatched requests
+// share one label tuple ("unmatched") rather than pinning a per-path
+// series — an attacker spraying random paths must not be able to
+// explode the label cardinality.
+func TestMetricsUnroutedFoldsToSingleBucket(t *testing.T) {
 	handler := Metrics(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 
-	beforeDump := dumpExpvar(t)
-	beforeRoutes := 0
-	if rm, ok := beforeDump["http_requests_route_total"].(map[string]any); ok {
-		beforeRoutes = len(rm)
+	for _, p := range []string{"/no-such-1", "/no-such-2", "/no-such-3"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		handler.ServeHTTP(httptest.NewRecorder(), req)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/no-such-route", nil)
-	handler.ServeHTTP(httptest.NewRecorder(), req)
-
-	afterDump := dumpExpvar(t)
-	afterRoutes := 0
-	if rm, ok := afterDump["http_requests_route_total"].(map[string]any); ok {
-		afterRoutes = len(rm)
+	got, err := countSeriesWithLabel("tinyurl_http_requests_total", "route", "unmatched")
+	if err != nil {
+		t.Fatalf("count series: %v", err)
 	}
-	if afterRoutes != beforeRoutes {
-		t.Errorf("route map grew from %d → %d after unrouted request; should not", beforeRoutes, afterRoutes)
+	// Exactly one series with label route=unmatched regardless of how
+	// many distinct paths we hit.
+	if got != 1 {
+		t.Errorf("unmatched series count = %d, want 1 (label cardinality leaked)", got)
 	}
 }
 
-// dumpExpvar marshals the global expvar registry into a generic map. We do
-// this rather than reaching into expvar.Map's unexported state.
-func dumpExpvar(t *testing.T) map[string]any {
+// counterValue reads the current value of tinyurl_http_requests_total
+// for the (route, status_class) label tuple. Returns 0 when the series
+// doesn't exist yet (first observation).
+func counterValue(t *testing.T, route, statusClass string) float64 {
 	t.Helper()
-	var sb strings.Builder
-	sb.WriteByte('{')
-	first := true
-	expvar.Do(func(kv expvar.KeyValue) {
-		if !first {
-			sb.WriteByte(',')
-		}
-		first = false
-		sb.WriteByte('"')
-		sb.WriteString(kv.Key)
-		sb.WriteString(`":`)
-		sb.WriteString(kv.Value.String())
-	})
-	sb.WriteByte('}')
-	var out map[string]any
-	if err := json.Unmarshal([]byte(sb.String()), &out); err != nil {
-		t.Fatalf("expvar dump parse: %v\n%s", err, sb.String())
+	families, err := metricsRegistry.Gather()
+	if err != nil {
+		t.Fatalf("registry gather: %v", err)
 	}
-	return out
+	for _, mf := range families {
+		if mf.GetName() != "tinyurl_http_requests_total" {
+			continue
+		}
+		for _, m := range mf.Metric {
+			if hasLabel(m, "route", route) && hasLabel(m, "status_class", statusClass) {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
 }
+
+// countSeriesWithLabel returns how many distinct series in the named
+// metric family carry (labelName, labelValue). Used to assert label
+// cardinality bounds.
+func countSeriesWithLabel(metricName, labelName, labelValue string) (int, error) {
+	families, err := metricsRegistry.Gather()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, mf := range families {
+		if mf.GetName() != metricName {
+			continue
+		}
+		for _, m := range mf.Metric {
+			if hasLabel(m, labelName, labelValue) {
+				n++
+			}
+		}
+	}
+	return n, nil
+}
+
+func hasLabel(m *dto.Metric, name, value string) bool {
+	for _, lp := range m.Label {
+		if lp.GetName() == name && lp.GetValue() == value {
+			return true
+		}
+	}
+	return false
+}
+

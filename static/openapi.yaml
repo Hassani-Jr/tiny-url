@@ -762,11 +762,13 @@ paths:
   /metrics:
     get:
       tags: [Operations]
-      summary: Expvar metrics exposition
+      summary: Prometheus metrics exposition
       description: |
-        Standard Go `expvar` JSON. Includes `http_requests_total` (status
-        class), `http_requests_route_total` (route + status class),
-        `http_requests_in_flight`, `panics_total`, plus runtime metrics.
+        Prometheus text exposition format. Includes
+        `tinyurl_http_requests_total{route,status_class}` (request counter),
+        `tinyurl_http_request_duration_seconds{route,status_class}` (latency
+        histogram), `tinyurl_http_requests_in_flight`, `tinyurl_panics_total`,
+        plus standard `process_*` and `go_*` runtime collectors.
 
         When `METRICS_TOKEN` is set, this endpoint requires
         `Authorization: Bearer <token>`; otherwise it is open.

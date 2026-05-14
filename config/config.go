@@ -78,6 +78,13 @@ type Config struct {
 	UnfurlWorkers   int
 	UnfurlQueueSize int
 	UnfurlTimeout   time.Duration
+	// GeoIPDBPath, when non-empty, points to a MaxMind GeoLite2-Country
+	// (or City — only the country.iso_code field is read) mmdb on disk.
+	// Overrides the embedded placeholder so operators can drop a fresh
+	// DB next to the binary without rebuilding. Empty falls back to the
+	// embedded file; with the shipped zero-byte placeholder that means
+	// country enrichment stays disabled.
+	GeoIPDBPath string
 }
 
 // Load reads configuration from environment variables, falling back to safe defaults.
@@ -111,6 +118,7 @@ func Load() Config {
 		UnfurlWorkers:        getEnvInt("UNFURL_WORKERS", 4),
 		UnfurlQueueSize:      getEnvInt("UNFURL_QUEUE", 256),
 		UnfurlTimeout:        time.Duration(getEnvInt("UNFURL_TIMEOUT_MS", 3000)) * time.Millisecond,
+		GeoIPDBPath:          os.Getenv("GEOIP_DB_PATH"),
 	}
 }
 

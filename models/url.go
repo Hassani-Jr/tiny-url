@@ -126,6 +126,20 @@ type AnalyticsResponse struct {
 	// can render the A/B configuration. Empty for single-destination
 	// URLs (the common case) — clients should fall back to original_url.
 	Destinations []Destination `json:"destinations,omitempty"`
+	// TopCountries summarizes country breakdown over the recent click
+	// window the server sampled (see handlers/analytics.go). Empty when
+	// no clicks have been recorded yet OR when geoip is disabled (every
+	// event's country field is then ""). Always sorted descending by
+	// count; ties resolved by ISO code for stable rendering.
+	TopCountries []CountryCount `json:"top_countries,omitempty"`
+}
+
+// CountryCount is one row of the analytics country breakdown. ISO is an
+// ISO-3166-1 alpha-2 code; empty ISO is suppressed by the aggregator so
+// "unknown" buckets don't leak into the response.
+type CountryCount struct {
+	ISO   string `json:"iso"`
+	Count int64  `json:"count"`
 }
 
 // ErrorResponse represents an error response
